@@ -13,7 +13,7 @@ existing data into the new layout.
 
 ## 1. Why
 
-The current `bin/aibox` is 2,379 lines, ~20 commands, and optimizes for
+The current `bin/aibox` is 2,379 lines, 16 commands, and optimizes for
 safety features and isolation modes that go unused, while getting the one
 thing that matters wrong: **data durability**.
 
@@ -40,9 +40,18 @@ Concrete problems in the current implementation:
   Cloudflare quick tunnel — workable, but slow, public, and not ideal.
 - **Unused surface area.** Safe mode + domain-allowlist firewall, restricted
   sudo, `--copy` / `--worktree` isolation, named instances, `--repo` clone
-  mode, compose file generation, `init` / WebStorm integration, `clean`,
+  mode, compose orchestration, `init` / WebStorm integration, `clean`,
   `nuke`, `doctor`, `volumes`, `disk` — none of it is used. It exists to
   serve hypothetical users, and it is where the 2,400 lines went.
+- **It writes into your project.** Plain `aibox up` auto-runs init when
+  `compose.dev.yaml` is missing (`bin/aibox:1314-1327`), dropping
+  `compose.dev.yaml`, `.aibox`, and `.idea/workspace.xml` into the project
+  and editing its `.gitignore`.
+- **Greedy global flag parsing.** All argv is scanned for aibox flags before
+  dispatch (`bin/aibox:251-325`), so `aibox claude -c` becomes aibox's
+  `--copy` instead of Claude's `--continue`; interactive prompts plus
+  unconditional `docker exec -it` also make non-interactive use
+  (`claude -p` in a pipe) impossible.
 
 ## 2. Product decisions (settled)
 
@@ -81,6 +90,11 @@ Rules:
 
 - Unknown command → help + exit 1. No interactive prompts anywhere except
   destructive confirmations (`restore`) and first-run niceties.
+- Everything after `claude` passes through to claude **verbatim** — v2 has
+  no global flags, so nothing gets swallowed the way v1's parser ate `-c`
+  (`bin/aibox:251-325`).
+- Allocate a TTY (`docker exec -it`) only when stdin is a terminal, so
+  `aibox claude -p "..."` and piped/scripted use work; v1 hard-coded `-it`.
 - `aibox claude` and `aibox shell` are the only commands that create things;
   everything they need (image, network, volume, container, proxy) is created
   idempotently on demand. There is no `up`/`build`/`init`.
@@ -127,6 +141,9 @@ Rules:
 - `docker exec` forwards `TERM`, `COLORTERM`, `LANG`, and any `ANTHROPIC_*`
   vars set on the host (kept from v1; the IDE-integration env plumbing is
   not kept).
+- No host dotfiles are mounted (`.gitconfig`, `~/.ssh` — same as v1). This
+  is fine in v2 precisely because the home volume persists: configure git
+  identity or SSH keys once inside the container and they stick forever.
 - Long-running init process: `sleep infinity` (or equivalent) so the
   container stays up independent of sessions. `--restart unless-stopped` so
   it survives Docker/Colima restarts. No healthcheck needed.
@@ -187,6 +204,9 @@ Dockerfile is embedded in the script (heredoc, as today) and written to
 - Optional user extension: if `~/.aibox/Dockerfile.extra` exists, its
   contents are appended to the generated Dockerfile before build. This is
   the supported way to make custom tooling survive image-change recreations.
+- Build with `docker build --pull` so the `node:*-bookworm` base actually
+  refreshes on rebuilds (v1 never pulled, so its base only updated by
+  accident).
 
 ### 4.5 State on the host
 
@@ -319,12 +339,16 @@ Removed entirely, with no deprecation shims — v2 is a clean break
 - Flags: `-n/--name`, `-r/--repo`, `-b/--branch`, `-c/--copy`,
   `-w/--worktree`, `-y/--yolo` (now the only behavior), `-s/--safe`,
   `-i/--image`, `--all`/`--clean` on `down`.
-- Mechanisms: compose file generation (`compose.dev.yaml`), socat
+- Mechanisms: compose orchestration (v1 pipes generated YAML into
+  `docker compose -f -`) and the JetBrains-facing `compose.dev.yaml`, socat
   port-forward sidecars, network firewall + `AIBOX_EXTRA_DOMAINS`,
   restricted sudo, sensitive-file detection, WebStorm/JetBrains config
-  generation, per-image `aibox-auth-*` volumes, auto-`down` on last session
-  exit, Colima/Docker auto-*install* (auto-*start* of an installed Colima
-  stays; installation becomes a printed one-liner hint).
+  generation, IDE-integration plumbing (`~/.claude/ide` ro-mount and
+  `ENABLE_IDE_INTEGRATION`/`CLAUDE_CODE_SSE_PORT` forwarding), per-image
+  `aibox-auth-*` volumes, auto-`down` on last session exit, mode-switch
+  `down`, Colima/Docker auto-*install* (auto-*start* of an installed
+  Colima/OrbStack/Docker Desktop stays; installation becomes a printed
+  one-liner hint).
 
 Target size: **~500 lines** of bash. If an addition pushes past that,
 something from this spec is being over-built.
