@@ -36,4 +36,4 @@ npm run release
 1. Update `version` in `package.json`
 2. Commit, then `npm run release` — CI handles the rest
 
-Note: `AIBOX_VERSION` in `bin/aibox` is separate — it tracks the Docker image format and only needs bumping when the Dockerfile or entrypoint changes (triggers automatic image rebuild for users).
+Note: the Docker image tag is derived from the CLI version (`aibox:<version>-node<node_version>`), so any release automatically rebuilds users' images and recreates their containers on next run — sessions and login live in the `aibox-home` volume and are unaffected. In a git checkout (unstamped `__CLI_VERSION__`) the tag is `aibox:dev-node<version>`.
