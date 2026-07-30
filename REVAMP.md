@@ -67,8 +67,8 @@ These were decided explicitly; the rewrite must not relitigate them.
 | D6 | Project mount | Bind-mount the project directory at **the same absolute path as on the host** (today's default-mode behavior, `bin/aibox:475`) | Claude session keys are derived from cwd — keeping the path keeps every existing session valid with zero migration |
 | D7 | Backup | Built-in `aibox backup` / `aibox restore` — clean and simple, must actually work | Replaces the external script |
 | D8 | Migration of old data | A **separate standalone script** (not part of the CLI) that merges both live `aibox-auth-*` volumes **and** old backup folders into the new `aibox-home` volume | One-time operation; keeps the CLI clean |
-| D9 | Dev-server access | Host-side reverse proxy with wildcard subdomains: `http://<port>.<project>.aibox.localhost` → container port. Replaces port-forward sidecars and ad-hoc Cloudflare tunnels for local use | `*.localhost` resolves to loopback natively in all modern browsers — zero setup, no sudo, no dnsmasq. `/etc/hosts` can't do wildcards, so no hosts-file step |
-| D10 | Base image | `node:${node_version}-bookworm` (Debian 12), `node_version` configurable in `~/.aibox/config`, default `22` | Debian-based official node images are the standard container base; glibc means nothing is uninstallable. Node version is a one-line config change |
+| D9 | Dev-server access | Host-side reverse proxy with wildcard subdomains: `http://<port>.<project>.aibox.localhost` → container port. Replaces port-forward sidecars and ad-hoc Cloudflare tunnels for local use | `*.localhost` (multi-level included) resolves to loopback natively in Chrome/Edge and Firefox 84+ with zero setup, no sudo, no dnsmasq; Safari only gained this on macOS 26 Tahoe (WebKit bug 160504). CLI tools using the system resolver (curl) don't resolve it — documented workaround, not solved. `/etc/hosts` can't do wildcards, so there is no hosts-file step |
+| D10 | Base image | `node:${node_version}-bookworm` (Debian 12), `node_version` configurable in `~/.aibox/config`, default = current Active LTS (`24` as of mid-2026; Node 22 entered maintenance Oct 2025, Node 20 is EOL) | Debian-based official node images are the standard container base; glibc means nothing is uninstallable. Node version is a one-line config change |
 | D11 | Command surface | Exactly the commands in §3. Everything else is deleted | See §8 for the deletion list |
 
 ## 3. Command surface
@@ -184,16 +184,23 @@ aibox claude/shell:
 Dockerfile is embedded in the script (heredoc, as today) and written to
 `~/.aibox/Dockerfile` at build time:
 
-- `FROM node:${node_version}-bookworm` — ships git, python3, make/g++,
-  openssl etc. out of the box.
+- `FROM node:${node_version}-bookworm` — verified to ship git, python3,
+  make, gcc/g++, and curl out of the box (~400 MB compressed, ~1.6 GB
+  uncompressed).
 - apt: `zsh sudo ripgrep fzf jq less procps curl` (keep this list short —
   the container persists, so Claude apt-installs anything else once and it
   sticks).
-- Claude Code installed via the native installer into `/home/aibox/.local`
-  **at first container start** (entrypoint checks, installs if missing) —
-  i.e. the binary lives in the `aibox-home` volume, so `claude update`
-  self-updates persist across container recreation and image rebuilds, and
-  all projects share one install. This is a hard constraint, not a
+- Claude Code installed via the native installer
+  (`curl -fsSL https://claude.ai/install.sh | bash`) **at first container
+  start** (entrypoint checks, installs if missing). The installer puts a
+  launcher at `~/.local/bin/claude` with versions under
+  `~/.local/share/claude/` — both inside the `aibox-home` volume — so
+  `claude update` (and the native install's background auto-updates)
+  persist across container recreation and image rebuilds, and all projects
+  share one install. Current Claude Code versions verifiably create
+  `.claude.json` *inside* `CLAUDE_CONFIG_DIR`, so all state lands in the
+  volume (very old builds handled `CLAUDE_CONFIG_DIR` inconsistently —
+  irrelevant here since the installer always fetches current). This is a hard constraint, not a
   preference: v1 bakes the installer into the image's home dir
   (`bin/aibox:556`), but in v2 the `aibox-home` volume mounts over all of
   `/home/aibox`, shadowing anything the image put there — so nothing may be
@@ -239,16 +246,37 @@ no commands, no restarts, no sidecars, no tunnels.
 - Config: a small generated Caddyfile (`~/.aibox/Caddyfile`) mounted into
   the proxy. When a project container is created or renamed, the CLI
   regenerates the file and reloads the proxy (`caddy reload` via exec —
-  ~instant, no dropped connections).
+  graceful, in-flight connections drain rather than drop).
+- The core routing needs no per-project config at all — this exact
+  Caddyfile was tested against `caddy:2-alpine` (v2.11) and routes
+  `Host: 5173.myapp.aibox.localhost` to container `aibox-myapp:5173`
+  (labels index right-to-left from zero):
+
+  ```
+  http://*.*.aibox.localhost {
+      reverse_proxy aibox-{http.request.host.labels.2}:{http.request.host.labels.3}
+  }
+  ```
+
+  Per-project regeneration is only needed because real container names
+  carry the `-<hash6>` suffix (§4.1) — a `map` block from slug to full
+  container name, rewritten on container create/rename.
 - WebSockets must work (Caddy's `reverse_proxy` handles them by default) —
   vite HMR is the primary consumer.
 - `aibox status` and container-start output print the concrete base URL,
   e.g. `http://5173.myapp.aibox.localhost`.
 - Inside the container, set an env var (e.g. `AIBOX_URL_BASE=myapp.aibox.localhost`)
   so Claude can tell the user the right URL for whatever port it just opened.
-- If port 80 on the host is taken, fall back to `proxy_port` from config
-  (default fallback 8080) and include the port in printed URLs
-  (`http://5173.myapp.aibox.localhost:8080`).
+- If publishing host port 80 fails (already taken, or the runtime can't),
+  fall back to `proxy_port` from config (default fallback 8080) and include
+  the port in printed URLs (`http://5173.myapp.aibox.localhost:8080`).
+  Low-port caveat on macOS: binding `127.0.0.1:80` specifically needs
+  privileges — Docker Desktop handles it via its privileged helper, while
+  Colima/OrbStack emulate loopback-only publishing by binding `0.0.0.0` and
+  rejecting non-loopback sources (old Colima versions ignored the loopback
+  restriction entirely, exposing the port on the LAN — acceptable here
+  since everything behind it is already yolo-mode dev traffic, but worth a
+  line in the README).
 - Non-goals: HTTPS (plain http on loopback is fine), public sharing
   (Cloudflare tunnels remain possible manually; a built-in `aibox share` is
   a future idea, §9), and CLI tools that don't respect `*.localhost` DNS
@@ -266,8 +294,11 @@ predictable; nothing in either path can delete data it didn't just save.
     `<dir>/aibox-home-<version>-<UTC timestamp>.tar.gz`. Default dir:
     `~/aibox-backups` (overridable in config).
   - Implemented as a throwaway helper container mounting the volume
-    **read-only** and streaming `tar` to the host. Safe to run while
-    containers are up; source is never written to.
+    **read-only** and streaming `tar` to the host (the pattern Docker's own
+    docs recommend for volume backup). Safe to run while containers are up
+    in the sense that the source is never written to; a session actively
+    appending its `.jsonl` mid-tar may be captured mid-write, which is
+    acceptable for append-only session logs.
   - Prints archive path + size; keeps every backup (no rotation in v2 — the
     user deletes old ones; a `backup_keep` config knob is a future idea).
 - `aibox restore <path>`
@@ -320,7 +351,7 @@ Merge rules:
 `~/.aibox/config`, `key=value`, all optional:
 
 ```
-node_version=22        # base image tag: node:<this>-bookworm
+node_version=24        # base image tag: node:<this>-bookworm
 proxy_port=80          # host port for the dev-server proxy
 backup_dir=~/aibox-backups
 ```
