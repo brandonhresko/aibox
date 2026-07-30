@@ -1,0 +1,374 @@
+# aibox v2 — Revamp Requirements
+
+Requirements for rewriting aibox around how it is actually used: one trusted
+machine, one user, Claude Code in yolo mode, containers that are cheap to
+enter and impossible to lose data in.
+
+This document is the spec for the rewrite. It records the decisions already
+made (with rationale), the exact command surface, the architecture, and what
+gets deleted. A separate one-time migration script (also specced here) moves
+existing data into the new layout.
+
+---
+
+## 1. Why
+
+The current `bin/aibox` is 2,379 lines, ~20 commands, and optimizes for
+safety features and isolation modes that go unused, while getting the one
+thing that matters wrong: **data durability**.
+
+Concrete problems in the current implementation:
+
+- **Destructive lifecycle by default.** When the last `claude`/`shell`
+  session exits, the script silently runs `docker compose down`
+  (`bin/aibox:1154-1170`). The container is *removed*, not stopped — every
+  apt package, global npm install, and any file outside a mounted volume is
+  destroyed. This has caused real data loss. A second destructive path:
+  running `aibox claude` in a different mode than the container was started
+  with (`--yolo` vs `--safe`) also `down`s the running container
+  (`bin/aibox:1447-1453`).
+- **Fragmented session history.** Auth/session state lives in a volume named
+  per image — `aibox-auth-<image>` (`bin/aibox:1068`). Change the image tag
+  and you get a fresh volume: new login, empty session list, old sessions
+  stranded in the previous volume. Multiple such volumes now exist, each
+  holding a slice of history.
+- **No first-class backup.** Backups currently depend on an external
+  hand-rolled script.
+- **Port forwarding is manual and clunky.** Each forwarded port is a
+  `alpine/socat` sidecar container created by hand (`aibox port-forward`).
+  In practice this was abandoned in favor of asking Claude to open a
+  Cloudflare quick tunnel — workable, but slow, public, and not ideal.
+- **Unused surface area.** Safe mode + domain-allowlist firewall, restricted
+  sudo, `--copy` / `--worktree` isolation, named instances, `--repo` clone
+  mode, compose file generation, `init` / WebStorm integration, `clean`,
+  `nuke`, `doctor`, `volumes`, `disk` — none of it is used. It exists to
+  serve hypothetical users, and it is where the 2,400 lines went.
+
+## 2. Product decisions (settled)
+
+These were decided explicitly; the rewrite must not relitigate them.
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| D1 | Language / distribution | Single bash file, published to npm as `aibox-cli` (same as today) | New scope is ~500 lines, not 2,400; zero runtime deps beyond Docker |
+| D2 | Security posture | Always yolo. No safe mode, no firewall, no restricted sudo | Isolation comes from the container boundary itself; the modes were never used |
+| D3 | Container lifecycle | Container **keeps running in the background** when the last session exits. `aibox stop` stops it explicitly. It is only ever *removed* when the image changes (and then only recreated, never left absent) | Instant re-attach; idle containers cost ~nothing; kills the data-loss footgun |
+| D4 | Instances | Exactly one container per project directory; multiple terminals just `exec` into the same container. No named instances | Matches real usage |
+| D5 | Session/home storage | One **global** named volume `aibox-home` mounted at `/home/aibox`, shared by all project containers | One login, one session history, one thing to back up; survives image changes by construction |
+| D6 | Project mount | Bind-mount the project directory at **the same absolute path as on the host** (today's default-mode behavior, `bin/aibox:475`) | Claude session keys are derived from cwd — keeping the path keeps every existing session valid with zero migration |
+| D7 | Backup | Built-in `aibox backup` / `aibox restore` — clean and simple, must actually work | Replaces the external script |
+| D8 | Migration of old data | A **separate standalone script** (not part of the CLI) that merges both live `aibox-auth-*` volumes **and** old backup folders into the new `aibox-home` volume | One-time operation; keeps the CLI clean |
+| D9 | Dev-server access | Host-side reverse proxy with wildcard subdomains: `http://<port>.<project>.aibox.localhost` → container port. Replaces port-forward sidecars and ad-hoc Cloudflare tunnels for local use | `*.localhost` resolves to loopback natively in all modern browsers — zero setup, no sudo, no dnsmasq. `/etc/hosts` can't do wildcards, so no hosts-file step |
+| D10 | Base image | `node:${node_version}-bookworm` (Debian 12), `node_version` configurable in `~/.aibox/config`, default `22` | Debian-based official node images are the standard container base; glibc means nothing is uninstallable. Node version is a one-line config change |
+| D11 | Command surface | Exactly the commands in §3. Everything else is deleted | See §8 for the deletion list |
+
+## 3. Command surface
+
+```
+aibox                      # same as `aibox claude`
+aibox claude [args...]     # ensure image/container/proxy, then run claude (yolo) inside; extra args pass through (--resume, -c, etc.)
+aibox shell [cmd...]       # zsh in the container, or run a one-off command
+aibox stop [--all]         # stop this project's container (--all: every aibox container + proxy). Never deletes anything
+aibox status               # all aibox containers: project, state, uptime, image; proxy URLs; volume size
+aibox backup [dir]         # snapshot aibox-home volume to a tar.gz on the host
+aibox restore <path>       # restore a backup into aibox-home (with automatic pre-restore safety backup)
+aibox update               # update CLI (npm), rebuild image if needed, mark containers for recreation
+aibox version              # CLI version, image version, docker info
+aibox help
+```
+
+Rules:
+
+- Unknown command → help + exit 1. No interactive prompts anywhere except
+  destructive confirmations (`restore`) and first-run niceties.
+- `aibox claude` and `aibox shell` are the only commands that create things;
+  everything they need (image, network, volume, container, proxy) is created
+  idempotently on demand. There is no `up`/`build`/`init`.
+- Keep v1's non-blocking update notice (`bin/aibox:2304-2326`): a cached,
+  24h-throttled npm version check that prints a one-line hint when a newer
+  `aibox-cli` exists. It must never block or slow a command.
+- Every command must be safe to run concurrently from multiple terminals
+  (two tabs running `aibox claude` simultaneously on the same project must
+  not race the container creation — use a lock or tolerate-exists creation).
+
+## 4. Architecture
+
+### 4.1 Naming and identity
+
+- Project identity = absolute path of the project directory (the cwd where
+  `aibox` is invoked; symlinks resolved).
+- Container name: `aibox-<slug>-<hash6>` where `<slug>` is the sanitized
+  directory basename and `<hash6>` is the first 6 hex chars of the SHA-256 of
+  the absolute path. Two directories both named `app` never collide.
+- Proxy hostname label: `<slug>` (see §5); on slug collision between two
+  *running* projects, the later one uses `<slug>-<hash6>`. `aibox status`
+  always shows the canonical URL.
+- Docker network: `aibox` (bridge), shared by all project containers and the
+  proxy.
+- Volume: `aibox-home`, mounted at `/home/aibox` in every project container.
+- Image: `aibox:<cli-version>` (e.g. `aibox:2.0.0`), so image staleness is
+  detectable by tag comparison alone.
+
+### 4.2 Container spec
+
+- Plain `docker run` / `docker exec` — **no docker compose**, no generated
+  YAML. One container needs no orchestrator, and compose's `down` semantics
+  were part of the original footgun.
+- Mounts:
+  - `aibox-home:/home/aibox`
+  - `<project-abs-path>:<project-abs-path>` (bind, rw), workdir = that path
+- `CLAUDE_CONFIG_DIR=/home/aibox/.claude` (unchanged from v1, so existing
+  `.claude` contents drop in as-is).
+- User `aibox` (uid 1000), passwordless sudo, login shell zsh. Note:
+  `node:*-bookworm` ships a `node` user already occupying uid 1000 — the
+  Dockerfile must remove it (`userdel -r node`) before creating `aibox`.
+- `--add-host host.docker.internal:host-gateway` so the container can reach
+  services on the Mac (kept from v1).
+- `docker exec` forwards `TERM`, `COLORTERM`, `LANG`, and any `ANTHROPIC_*`
+  vars set on the host (kept from v1; the IDE-integration env plumbing is
+  not kept).
+- Long-running init process: `sleep infinity` (or equivalent) so the
+  container stays up independent of sessions. `--restart unless-stopped` so
+  it survives Docker/Colima restarts. No healthcheck needed.
+- Sessions are `docker exec -it` — a session ending never affects the
+  container.
+
+### 4.3 Lifecycle
+
+```
+aibox claude/shell:
+  docker running?          → if colima installed but stopped: colima start; else error with install hint
+  image aibox:<ver> exists? → build if missing (first run or post-update)
+  container exists?
+    ├─ no  → create (docker run -d)
+    ├─ yes, stopped → docker start
+    └─ yes, running → (nothing)
+  container image ≠ aibox:<ver>?
+    → if no active exec sessions: recreate (rm + run; aibox-home and project
+      bind survive by construction; warn that apt-installed packages reset)
+    → if sessions active: warn and continue on the old image
+  proxy running? → start if not (§5)
+  docker exec -it <container> <claude|zsh> ...
+```
+
+- `claude` is invoked with `--dangerously-skip-permissions` plus any
+  passthrough args.
+- **Nothing happens on session exit.** No idle-detection, no auto-stop, no
+  down. The container idles at ~zero CPU until the next attach or an
+  explicit `aibox stop`.
+- `aibox stop` = `docker stop` only. A stopped container preserves its
+  writable layer (apt installs etc.); next `aibox claude` starts it again in
+  ~1s.
+- The only code path that ever runs `docker rm` on a project container is
+  image-change recreation, which immediately recreates it.
+
+### 4.4 Image
+
+Dockerfile is embedded in the script (heredoc, as today) and written to
+`~/.aibox/Dockerfile` at build time:
+
+- `FROM node:${node_version}-bookworm` — ships git, python3, make/g++,
+  openssl etc. out of the box.
+- apt: `zsh sudo ripgrep fzf jq less procps curl` (keep this list short —
+  the container persists, so Claude apt-installs anything else once and it
+  sticks).
+- Claude Code installed via the native installer into `/home/aibox/.local`
+  **at first container start** (entrypoint checks, installs if missing) —
+  i.e. the binary lives in the `aibox-home` volume, so `claude update`
+  self-updates persist across container recreation and image rebuilds, and
+  all projects share one install. This is a hard constraint, not a
+  preference: v1 bakes the installer into the image's home dir
+  (`bin/aibox:556`), but in v2 the `aibox-home` volume mounts over all of
+  `/home/aibox`, shadowing anything the image put there — so nothing may be
+  installed into the home directory at image-build time.
+- The entrypoint also fixes ownership of `/home/aibox` on start (migrated
+  v1 volumes can contain root-owned files; v1 did the same for `.claude`,
+  `bin/aibox:572`).
+- Optional user extension: if `~/.aibox/Dockerfile.extra` exists, its
+  contents are appended to the generated Dockerfile before build. This is
+  the supported way to make custom tooling survive image-change recreations.
+
+### 4.5 State on the host
+
+```
+~/.aibox/
+  config             # key=value, see §7
+  Dockerfile         # generated at build (informational; regenerated each build)
+  Dockerfile.extra   # optional, user-authored
+  Caddyfile          # generated proxy config (§5)
+~/aibox-backups/     # default backup destination (§6)
+```
+
+`~/.config/aibox` (v1) is left untouched; the migration script may read it,
+the new CLI never does.
+
+## 5. Dev-server proxy
+
+Goal: Claude starts `vite` / `next dev` / `wrangler dev` on any port inside
+the container, and the host browser reaches it immediately at a stable URL —
+no commands, no restarts, no sidecars, no tunnels.
+
+- One shared container `aibox-proxy` (image: `caddy:2-alpine`), on the
+  `aibox` network, publishing `127.0.0.1:80->80`. Started lazily by the
+  first `aibox claude`/`shell`; stopped by `aibox stop --all`.
+- Routing rule: request `Host` of the form `<port>.<slug>.aibox.localhost`
+  reverse-proxies to `aibox-<slug>-<hash6>:<port>` over the Docker network.
+  Because the proxy reaches containers directly on the internal network, **no
+  container ports are ever published** — any port works dynamically, ports
+  the app opens after container start included.
+- Config: a small generated Caddyfile (`~/.aibox/Caddyfile`) mounted into
+  the proxy. When a project container is created or renamed, the CLI
+  regenerates the file and reloads the proxy (`caddy reload` via exec —
+  ~instant, no dropped connections).
+- WebSockets must work (Caddy's `reverse_proxy` handles them by default) —
+  vite HMR is the primary consumer.
+- `aibox status` and container-start output print the concrete base URL,
+  e.g. `http://5173.myapp.aibox.localhost`.
+- Inside the container, set an env var (e.g. `AIBOX_URL_BASE=myapp.aibox.localhost`)
+  so Claude can tell the user the right URL for whatever port it just opened.
+- If port 80 on the host is taken, fall back to `proxy_port` from config
+  (default fallback 8080) and include the port in printed URLs
+  (`http://5173.myapp.aibox.localhost:8080`).
+- Non-goals: HTTPS (plain http on loopback is fine), public sharing
+  (Cloudflare tunnels remain possible manually; a built-in `aibox share` is
+  a future idea, §9), and CLI tools that don't respect `*.localhost` DNS
+  (curl needs `--resolve`; documented, not solved — `/etc/hosts` has no
+  wildcard support so there is no standard hosts-file fix).
+
+## 6. Backup and restore
+
+Design principle: a backup is one portable file; restore is dumb and
+predictable; nothing in either path can delete data it didn't just save.
+
+- `aibox backup [dir]`
+  - Snapshots the **entire `aibox-home` volume** (sessions, `.claude.json`,
+    credentials, shell history, claude binary, npm globals) to
+    `<dir>/aibox-home-<version>-<UTC timestamp>.tar.gz`. Default dir:
+    `~/aibox-backups` (overridable in config).
+  - Implemented as a throwaway helper container mounting the volume
+    **read-only** and streaming `tar` to the host. Safe to run while
+    containers are up; source is never written to.
+  - Prints archive path + size; keeps every backup (no rotation in v2 — the
+    user deletes old ones; a `backup_keep` config knob is a future idea).
+- `aibox restore <path>`
+  - `<path>` is an archive produced by `aibox backup`.
+  - Steps: (1) require confirmation, (2) automatically run a safety backup
+    of the current volume first, (3) stop containers using the volume,
+    (4) wipe the volume and extract the archive into it, (5) restart what
+    was running.
+  - Restore is **replace**, not merge — merging heterogeneous histories is
+    the migration script's job (§6.1). This keeps restore trivially
+    predictable: after restore, the volume equals the backup, and the state
+    it replaced is itself a backup.
+
+### 6.1 Migration script (separate, one-time)
+
+`scripts/migrate-to-v2.sh` — lives in the repo, runs standalone (not part of
+the npm bin, never called by the CLI).
+
+Sources, all merged into the (possibly already-populated) `aibox-home`
+volume:
+
+1. **Every `aibox-auth-*` Docker volume** found on the machine (running or
+   stopped v1 containers don't matter; sources are only ever read).
+2. **Old backup folders** produced by the user's existing external backup
+   script, passed as arguments: `migrate-to-v2.sh [backup-dir ...]`.
+
+Merge rules:
+
+- Everything except `.claude.json`: copy the **entire volume tree
+  no-clobber** — don't enumerate directories (v1 volumes contain at least
+  `projects/`, `todos/`, `session-env/`, `file-history/`,
+  `shell-snapshots/`, per `bin/aibox:2047`, and the set may vary by Claude
+  Code version). Sessions are one file per UUID, so a plain union is
+  correct. Count copied vs skipped and report.
+- `.claude.json`: start from the newest copy (by mtime), then merge the
+  `projects` map keys from every other copy via `jq` (newest wins per key).
+  OAuth/credentials come from the newest copy only.
+- Session-key paths: default-mode v1 sessions are keyed by host paths (D6)
+  and need **no remapping**. Old `--copy`/`--worktree` sessions keyed under
+  `/workspace/...` are copied as-is (harmless), with an optional
+  `--map /workspace/foo=/Users/me/foo` flag to rekey them if ever wanted.
+- Idempotent: running it twice changes nothing the second time.
+- Strictly read-only on all sources. It never stops, deletes, or edits v1
+  containers, volumes, or backup folders — the user deletes those manually
+  after verifying (`docker volume rm`, etc.; the script prints the exact
+  cleanup commands as its final output but does not run them).
+
+## 7. Config
+
+`~/.aibox/config`, `key=value`, all optional:
+
+```
+node_version=22        # base image tag: node:<this>-bookworm
+proxy_port=80          # host port for the dev-server proxy
+backup_dir=~/aibox-backups
+```
+
+No per-project config file in v2 (v1's `.aibox` is ignored). Changing
+`node_version` takes effect via `aibox update` (image rebuild → containers
+recreate on next start).
+
+## 8. Deleted from v1
+
+Removed entirely, with no deprecation shims — v2 is a clean break
+(major-version bump of `aibox-cli`):
+
+- Commands: `up`, `down`, `build`, `init`, `port-forward`, `volumes`,
+  `disk`, `clean`, `nuke`, `doctor`.
+- Flags: `-n/--name`, `-r/--repo`, `-b/--branch`, `-c/--copy`,
+  `-w/--worktree`, `-y/--yolo` (now the only behavior), `-s/--safe`,
+  `-i/--image`, `--all`/`--clean` on `down`.
+- Mechanisms: compose file generation (`compose.dev.yaml`), socat
+  port-forward sidecars, network firewall + `AIBOX_EXTRA_DOMAINS`,
+  restricted sudo, sensitive-file detection, WebStorm/JetBrains config
+  generation, per-image `aibox-auth-*` volumes, auto-`down` on last session
+  exit, Colima/Docker auto-*install* (auto-*start* of an installed Colima
+  stays; installation becomes a printed one-liner hint).
+
+Target size: **~500 lines** of bash. If an addition pushes past that,
+something from this spec is being over-built.
+
+## 9. Non-goals / future ideas
+
+Not in v2; recorded so they aren't accidentally half-built:
+
+- `aibox share <port>` — public URL via `cloudflared` quick tunnel (the
+  current manual workflow, automated).
+- Backup rotation (`backup_keep=N`).
+- Linux hosts as a first-class target (nothing should actively break, but
+  macOS + Colima/Docker Desktop/OrbStack is what gets tested).
+- Multiple containers per project, non-Claude agent presets, Homebrew tap
+  refresh.
+
+## 10. Acceptance criteria
+
+The rewrite is done when all of these hold:
+
+1. `cd proj && aibox` on a fresh machine (Docker present): builds image,
+   creates volume/network/container/proxy, lands in a yolo Claude session.
+2. Exit Claude, run `aibox claude` again → re-attached in under a second;
+   `apt install imagemagick` from a previous session is still installed.
+3. Two terminal tabs, same project: both `aibox claude` concurrently → two
+   sessions, one container, no race errors.
+4. `aibox stop && aibox claude` → container starts again with all state
+   (including apt layer) intact.
+5. Claude runs `npx vite` (port 5173) inside the container →
+   `http://5173.<slug>.aibox.localhost` serves it in the host browser with
+   working HMR, with no port ever having been published or configured.
+6. `aibox update` after a version bump → next `aibox claude` recreates the
+   container on the new image; all Claude sessions, login, and `claude`
+   binary version are unchanged (home volume); a warning notes the apt
+   layer reset.
+7. `aibox backup` while a session is running → single `.tar.gz`;
+   `aibox restore` of it onto a wiped volume reproduces login + full
+   session list (`claude --resume` shows history).
+8. `scripts/migrate-to-v2.sh <old-backup-dir>` on a machine with existing
+   `aibox-auth-*` volumes → one `aibox-home` volume where `claude --resume`
+   in a previously-used project lists sessions that originated from *both*
+   the live volumes and the old backup folders; running it again reports
+   zero new files.
+9. Deleting any project container (`docker rm -f`) loses no Claude data —
+   next `aibox claude` recreates it and every session is still there.
+10. `grep -c '' bin/aibox` is in the ~500-line ballpark, and no command
+    outside §3 exists.
