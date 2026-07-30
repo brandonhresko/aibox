@@ -26,6 +26,7 @@
   },
   "files": [
     "bin/aibox",
+    "scripts/migrate-to-v2.sh",
     "README.md",
     "LICENSE"
   ],

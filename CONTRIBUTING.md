@@ -37,3 +37,7 @@ npm run release
 2. Commit, then `npm run release` — CI handles the rest
 
 Note: the Docker image tag is derived from the CLI version (`aibox:<version>-node<node_version>`), so any release automatically rebuilds users' images and recreates their containers on next run — sessions and login live in the `aibox-home` volume and are unaffected. In a git checkout (unstamped `__CLI_VERSION__`) the tag is `aibox:dev-node<version>`.
+
+Two stamping caveats:
+- The release workflow's sed must replace ONLY the `CLI_VERSION=` assignment — the script contains two more `__CLI_VERSION__` occurrences that are runtime dev-build sentinels and must survive stamping.
+- The Homebrew formula installs from the raw git tag, which is unstamped. The tap formula should `inreplace` the same assignment during install; until it does, brew installs behave like dev builds (image `aibox:dev-*`, no update notice).

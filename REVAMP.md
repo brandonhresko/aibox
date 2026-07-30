@@ -396,6 +396,21 @@ Not in v2; recorded so they aren't accidentally half-built:
 - Multiple containers per project, non-Claude agent presets, Homebrew tap
   refresh.
 
+## 9b. Accepted implementation deviations
+
+Recorded post-implementation; intentional:
+
+- Image tag is `aibox:<cli-version>-node<node_version>` (not bare
+  `aibox:<cli-version>`) so a `node_version` config change also triggers
+  rebuild + recreation by pure tag comparison.
+- Proxy slug-collision labels are computed over all project containers
+  (running or stopped), not just running ones — URLs stay stable across
+  stop/start.
+- `aibox status` shows the image only when it differs from current (as a
+  "will be recreated" note) rather than as a column.
+- Unstamped git checkouts run as version `dev` (image `aibox:dev-node<v>`),
+  with the npm update notice disabled.
+
 ## 10. Acceptance criteria
 
 The rewrite is done when all of these hold:

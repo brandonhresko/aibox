@@ -61,8 +61,11 @@ Backups are safe to take while sessions are running.
 v2 is a clean break: one always-yolo container per project, one shared home volume, and no destructive lifecycle. A standalone script merges all your v1 data — every per-image `aibox-auth-*` volume **and** any old backup folders — into the new volume:
 
 ```bash
-./scripts/migrate-to-v2.sh                    # live v1 volumes only
-./scripts/migrate-to-v2.sh ~/old-backup-dir   # plus old backup folders
+# npm installs ship the script next to the CLI:
+bash "$(npm root -g)/aibox-cli/scripts/migrate-to-v2.sh" [old-backup-dir ...]
+
+# or fetch it directly:
+curl -fsSL https://raw.githubusercontent.com/blitzdotdev/aibox/main/scripts/migrate-to-v2.sh | bash -s -- [old-backup-dir ...]
 ```
 
 Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are read-only), `.claude.json` is merged newest-wins, and the script prints — but never runs — the cleanup commands for old v1 resources.
@@ -90,7 +93,7 @@ proxy_port=80          # host port for the dev-server proxy
 backup_dir=~/aibox-backups
 ```
 
-The image is `node:<version>-bookworm` (Debian) plus zsh, sudo, ripgrep, fzf, and jq — Claude apt-installs anything else on demand, and it persists across stop/start. To make custom tooling survive image rebuilds too, put extra Dockerfile lines in `~/.aibox/Dockerfile.extra`.
+The image is `node:<version>-bookworm` (Debian) plus a few basics (zsh, sudo, ripgrep, fzf, jq, less, procps) — Claude apt-installs anything else on demand, and it persists across stop/start. To make custom tooling survive image rebuilds too, put extra Dockerfile lines in `~/.aibox/Dockerfile.extra`.
 
 ## Prerequisites
 
@@ -101,6 +104,8 @@ brew install colima docker && colima start
 ```
 
 aibox auto-starts an installed-but-stopped runtime; it won't install one for you.
+
+Note on the dev-server proxy port: the proxy asks Docker for `127.0.0.1:80` only, but some Colima versions ignore the loopback restriction and publish the port on your LAN. Everything behind it is your own yolo-mode dev traffic, but if that matters to you, keep Colima current (or use OrbStack/Docker Desktop).
 
 ## Contributing
 
