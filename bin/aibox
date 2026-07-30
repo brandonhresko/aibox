@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # aibox — persistent Docker sandboxes for Claude Code.
 #
+# One container per project. One shared home volume (aibox-home) holds all
+# Claude state. Nothing is ever deleted without asking.
+#
 # Usage:
 #   aibox [claude] [args...]  Start/attach this project's container and run
-#                             Claude Code (yolo). Extra args pass to claude
-#                             verbatim (--resume, -p, --model, ...).
+#                             Claude Code with no permission prompts — the
+#                             container is the sandbox. Extra args pass to
+#                             claude verbatim (--resume, -p, --model, ...).
 #                             `aibox --resume` also works.
-#   aibox shell [cmd...]      zsh in the container, or run a one-off command
+#   aibox shell [cmd...]      zsh in the container. One argument runs as a
+#                             shell string (pipes/globs work); several run
+#                             as a safely-quoted command.
 #   aibox stop [--all]        Stop this project's container
 #                             (--all: every aibox container + proxy).
 #                             Never deletes anything; next run re-attaches.
@@ -24,7 +30,9 @@
 #   http://<port>.<project>.aibox.localhost
 # (Chrome/Edge/Firefox out of the box; Safari needs macOS 26+. No ports to
 # publish, no restarts — the proxy reaches the container over the Docker
-# network.)
+# network.) Inside the container, $AIBOX_URL_BASE holds
+# "<project>.aibox.localhost[:port]", and exported ANTHROPIC_* host vars
+# are forwarded.
 #
 # Config (~/.aibox/config, key=value, all optional):
 #   node_version=24           # base image: node:<this>-bookworm
@@ -37,10 +45,14 @@
 # All Claude state (sessions, login, the claude binary itself) lives in one
 # shared Docker volume: aibox-home. Containers are disposable; the volume is
 # the thing `aibox backup` protects.
+#
+# (This header is the output of `aibox help` — keep it accurate.)
 
 set -euo pipefail
 unset CDPATH
 
+# Replaced by the release workflow; left as-is = running from a git
+# checkout, which behaves as version "dev".
 CLI_VERSION="__CLI_VERSION__"
 CONFIG_DIR="${HOME}/.aibox"
 VOLUME="aibox-home"
@@ -77,20 +89,21 @@ if [[ -f "${CONFIG_DIR}/config" ]]; then
     esac
   done < "${CONFIG_DIR}/config"
 fi
+mkdir -p "$CONFIG_DIR"
 
 # ── Derived names ────────────────────────────────────────────────
 PROJECT_DIR="$(pwd -P)"
 SLUG="$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/_/-/g')"
-if command -v sha256sum >/dev/null 2>&1; then
-  HASH6="$(printf '%s' "$PROJECT_DIR" | sha256sum | cut -c1-6)"
-else
-  HASH6="$(printf '%s' "$PROJECT_DIR" | shasum -a 256 | cut -c1-6)"
-fi
+HASH6="$(printf '%s' "$PROJECT_DIR" | { sha256sum || shasum -a 256; } 2>/dev/null | cut -c1-6)"
+# Name format aibox-<slug>-<hash6> is load-bearing: _proxy_pairs extracts
+# the trailing hash6 with ${name##*-} for slug-collision URLs.
 CONTAINER="aibox-${SLUG}-${HASH6}"
-IMG_VER="$CLI_VERSION"
-[[ "$IMG_VER" == "__CLI_VERSION__" ]] && IMG_VER="dev"
-IMAGE="aibox:${IMG_VER}-node${NODE_VERSION}"
+VERSION_TAG="$CLI_VERSION"
+[[ "$VERSION_TAG" == "__CLI_VERSION__" ]] && VERSION_TAG="dev"
+# VERSION_TAG also names backups (aibox-home-<tag>-<time>.tar.gz).
+IMAGE="aibox:${VERSION_TAG}-node${NODE_VERSION}"
 
+# ── Small helpers ────────────────────────────────────────────────
 _require_safe_dir() {
   case "$PROJECT_DIR" in
     "$HOME"|/|/tmp|/var|/etc|/usr|/opt|/private|/private/tmp)
@@ -130,18 +143,19 @@ _ensure_docker() {
     _info "Docker daemon not running. Starting Docker Desktop..."
     open -a Docker
   else
-    _die "Docker daemon not running. Start your Docker runtime and retry."
+    _die "Docker daemon not running. Start it (Linux: sudo systemctl start docker; macOS: open your Docker app) and retry."
   fi
   local i=0
   until docker info >/dev/null 2>&1; do
-    (( i++ >= 60 )) && _die "Docker daemon did not come up. Try again in a moment."
+    (( i++ >= 60 )) && _die "Docker daemon did not come up. Try again in a moment."   # 60s
     sleep 1
   done
 }
 
 # ── Image ────────────────────────────────────────────────────────
 _build_image() {
-  mkdir -p "$CONFIG_DIR"
+  # Unquoted heredoc so ${NODE_VERSION} interpolates — hence the \\ and
+  # \$PATH escapes. Don't quote the delimiter.
   cat > "${CONFIG_DIR}/Dockerfile" <<DOCKERFILE
 FROM node:${NODE_VERSION}-bookworm
 
@@ -173,6 +187,12 @@ rm -f /tmp/aibox-ready
 # /home/aibox is a named volume; normalize ownership on every container start
 # (data migrated from v1 or restored from backups may carry other UIDs).
 chown -R aibox:aibox /home/aibox 2>/dev/null || true
+# A fresh volume has no .zshrc — without one, the first interactive zsh
+# opens the zsh-newuser-install questionnaire.
+if [[ ! -e /home/aibox/.zshrc ]]; then
+  printf 'autoload -Uz compinit && compinit\nPROMPT="%%F{cyan}%%1~%%f %%# "\n' > /home/aibox/.zshrc
+  chown aibox:aibox /home/aibox/.zshrc
+fi
 # First start with an empty home volume: install Claude Code into the volume
 # so the binary and its self-updates persist across container recreation.
 # (Anything baked into the image's home dir would be shadowed by the mount.)
@@ -183,7 +203,7 @@ fi
 touch /tmp/aibox-ready
 exec "$@"
 ENTRYPOINT
-  _info "Building ${IMAGE} (one-time; rebuilt only when aibox or node_version changes)..."
+  _info "Building ${IMAGE} (one-time; rebuilt only when aibox is updated or node_version changes)..."
   docker build --pull -t "$IMAGE" "$CONFIG_DIR"
   _ok "Image built."
 }
@@ -196,23 +216,27 @@ _ensure_image() {
 # One shared reverse proxy on the aibox network. Any request to
 # <port>.<slug>.aibox.localhost is proxied to <container>:<port> over the
 # Docker network — no ports are ever published on project containers.
+# (These helpers run inside $(...) where set -e is off — keep them
+# read-only.)
 
 # All v2 project containers, oldest first (stable UTC creation time):
-# "slug<TAB>/name" per line.
+# "slug name" per line. Space-separated: docker inspect --format passes \t
+# through literally (unlike docker ps), and none of the fields contain
+# spaces.
 _project_rows() {
   local ids
   ids="$(docker ps -aq --filter label=aibox.slug 2>/dev/null | tr '\n' ' ')"
   [[ -z "${ids// /}" ]] && return 0
   # shellcheck disable=SC2086
-  docker inspect --format '{{.Created}}\t{{index .Config.Labels "aibox.slug"}}\t{{.Name}}' $ids 2>/dev/null \
-    | sort | cut -f2,3
+  docker inspect --format '{{.Created}} {{index .Config.Labels "aibox.slug"}} {{.Name}}' $ids 2>/dev/null \
+    | sort | cut -d' ' -f2,3
 }
 
 # Emit "publiclabel name" pairs; the oldest project keeps the bare slug,
 # later slug collisions get slug-hash6.
 _proxy_pairs() {
-  local slug name key seen=" "
-  while IFS=$'\t' read -r slug name; do
+  local slug name key seen=" "   # space-delimited set (bash 3.2: no assoc arrays)
+  while read -r slug name; do
     name="${name#/}"   # docker inspect .Name has a leading slash
     [[ -z "$name" ]] && continue
     key="$slug"
@@ -233,6 +257,8 @@ _pub_label() {
 _gen_caddyfile() {
   echo "# Generated by aibox — do not edit (regenerated on every run)."
   echo "http://*.*.aibox.localhost {"
+  # Caddy indexes host labels right-to-left from zero:
+  # <port>.<project>.aibox.localhost → labels.3=port, labels.2=project.
   echo "    map {http.request.host.labels.2} {upstream} {"
   local key name
   while read -r key name; do
@@ -259,8 +285,9 @@ _start_proxy_on() {  # $1 = host port; returns docker run's status
     "$PROXY_IMAGE" >/dev/null 2>&1
 }
 
+# Branches: running → reload config; absent → create (handling both a
+# parallel-creation race and a busy host port); stopped → start.
 _ensure_proxy() {
-  mkdir -p "$CONFIG_DIR"
   local file="${CONFIG_DIR}/Caddyfile" tmp="${CONFIG_DIR}/Caddyfile.$$"
   # Truncate-write in place: the running proxy bind-mounts this exact inode,
   # so replacing the file (mv) would detach it. Per-PID temp file: parallel
@@ -271,49 +298,46 @@ _ensure_proxy() {
   fi
   rm -f "$tmp"
 
-  local state
-  state="$(_state "$PROXY")"
-  case "$state" in
+  case "$(_state "$PROXY")" in
     running)
       docker exec "$PROXY" caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
         || docker restart "$PROXY" >/dev/null 2>&1 || true
       ;;
     absent)
+      _info "Starting dev-server proxy (first run pulls a small Caddy image)..."
       if ! _start_proxy_on "$PROXY_PORT"; then
-        # A parallel invocation may have won the creation race — if the name
-        # exists now, that proxy is healthy; use it instead of nuking it.
-        if [[ "$(_state "$PROXY")" != "absent" ]]; then
-          docker start "$PROXY" >/dev/null 2>&1 || true
-          return 0
-        fi
-        if [[ "$PROXY_PORT" == "80" ]]; then
-          _warn "Host port 80 unavailable — proxy on 8080 instead (URLs get :8080)."
+        # Two look-alike failures: a parallel invocation won the creation
+        # race (its proxy reaches "running"; the name-conflict loser leaves
+        # nothing), or the host port is busy (docker leaves a dead Created-
+        # state container holding the name — must be removed before retry).
+        sleep 1
+        if [[ "$(_state "$PROXY")" != "running" ]]; then
           docker rm -f "$PROXY" >/dev/null 2>&1 || true
-          _start_proxy_on 8080 \
-            || { _warn "Dev-server proxy failed to start; containers still work."; return 0; }
-        else
-          _warn "Dev-server proxy failed to start on port ${PROXY_PORT}; containers still work."
-          return 0
+          if [[ "$PROXY_PORT" == "80" ]] && _start_proxy_on 8080; then
+            _warn "Host port 80 unavailable — proxy on 8080 instead (URLs get :8080)."
+          else
+            _warn "Dev-server proxy failed to start on port ${PROXY_PORT}; containers still work."
+          fi
         fi
       fi
       ;;
     *)
-      docker start "$PROXY" >/dev/null 2>&1 || true
-      docker exec "$PROXY" caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || true
+      docker start "$PROXY" >/dev/null 2>&1 || true   # caddy re-reads the config on start
       ;;
   esac
 }
 
 # ── Container ────────────────────────────────────────────────────
-CREATED=false
+CREATED=false   # set by _ensure_container, read by _ensure_all's first-run banner
 
 _ensure_container() {
   docker network create "$NETWORK" >/dev/null 2>&1 || true
   docker volume create "$VOLUME" >/dev/null 2>&1 || true
-  mkdir -p "$CONFIG_DIR"
 
-  # Serialize create/recreate across concurrent invocations (mkdir is atomic).
-  # A lock older than ~15s is presumed dead and stolen.
+  # Serialize create/recreate across concurrent invocations (mkdir is
+  # atomic): without this, two new-version invocations could both decide to
+  # recreate and the second would rm the first's fresh container. A lock
+  # older than ~15s is presumed dead and stolen.
   local lock="${CONFIG_DIR}/.lock-${CONTAINER}" waited=0
   until mkdir "$lock" 2>/dev/null; do
     (( waited++ >= 150 )) && { rmdir "$lock" 2>/dev/null || true; waited=0; }
@@ -321,33 +345,33 @@ _ensure_container() {
   done
   trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 
-  local state
-  state="$(_state "$CONTAINER")"
+  local state cur_img
+  read -r state cur_img < <(docker inspect "$CONTAINER" \
+    --format '{{.State.Status}} {{.Config.Image}}' 2>/dev/null) || true
+  state="${state:-absent}"
 
   # Recreate only when the image changed (new aibox version or node_version).
   # The home volume and project bind survive by construction.
-  if [[ "$state" != "absent" ]]; then
-    local cur_img
-    cur_img="$(docker inspect "$CONTAINER" --format '{{.Config.Image}}' 2>/dev/null | tr -d '[:space:]')"
-    if [[ -n "$cur_img" && "$cur_img" != "$IMAGE" ]]; then
-      local active=0
-      if [[ "$state" == "running" ]]; then
-        active="$(docker top "$CONTAINER" -o pid,args 2>/dev/null | tail -n +2 | grep -vc 'sleep infinity' || true)"
-        active="${active//[^0-9]/}"
-      fi
-      if [[ "${active:-0}" -gt 0 ]]; then
-        _warn "Image updated (${cur_img} → ${IMAGE}) but ${active} process(es) still running in the old container — keeping it for now. To update: exit sessions / stop dev servers, then run: aibox stop && aibox"
-      else
-        _info "Image changed (${cur_img} → ${IMAGE}). Recreating container — sessions/login/project files persist; apt-installed packages reset (use ~/.aibox/Dockerfile.extra to keep them)."
-        docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-        state=absent
-      fi
+  if [[ "$state" != "absent" && -n "${cur_img:-}" && "$cur_img" != "$IMAGE" ]]; then
+    local active=0
+    if [[ "$state" == "running" ]]; then
+      active="$(docker top "$CONTAINER" -o pid,args 2>/dev/null | tail -n +2 | grep -vc 'sleep infinity' || true)"
+      active="${active//[^0-9]/}"   # arithmetic-safe
+    fi
+    if [[ "${active:-0}" -gt 0 ]]; then
+      _warn "Image updated (${cur_img} → ${IMAGE}) but ${active} process(es) still running in the old container — keeping it for now. To update: exit sessions / stop dev servers, then run: aibox stop && aibox"
+    else
+      _info "Image changed (${cur_img} → ${IMAGE}). Recreating container — sessions/login/project files persist; apt-installed packages reset (use ~/.aibox/Dockerfile.extra to keep them)."
+      docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+      state=absent
     fi
   fi
 
   if [[ "$state" == "absent" ]]; then
     _require_safe_dir
     local run_err=""
+    # 2>&1 >/dev/null captures stderr only (order matters) — shown by the
+    # retry loop below if the container never comes up.
     run_err="$(docker run -d --name "$CONTAINER" \
       --network "$NETWORK" \
       --restart unless-stopped \
@@ -359,7 +383,7 @@ _ensure_container() {
       -e CLAUDE_CONFIG_DIR=/home/aibox/.claude \
       -l "aibox.slug=${SLUG}" \
       -l "aibox.path=${PROJECT_DIR}" \
-      "$IMAGE" 2>&1 >/dev/null)" || true
+      "$IMAGE" 2>&1 >/dev/null)" || true   # || true: parallel tab may have created it
     CREATED=true
   elif [[ "$state" != "running" ]]; then
     docker start "$CONTAINER" >/dev/null 2>&1 || true
@@ -370,36 +394,37 @@ _ensure_container() {
 
   local i=0
   until [[ "$(docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null)" == "true" ]]; do
-    (( i++ >= 25 )) && _die "Container failed to start.${run_err:+ ${run_err}}"
+    (( i++ >= 25 )) && _die "Container failed to start.${run_err:+ ${run_err}}"   # 5s
     docker start "$CONTAINER" >/dev/null 2>&1 || true
     sleep 0.2
   done
 }
 
 _ensure_claude_bin() {
-  # Wait for the entrypoint's start-up work (ownership fix + first-time
-  # claude install) so we don't race a half-finished install. Containers
-  # from older images never write the marker — the claude test breaks the
-  # wait for those.
-  local i=0
-  until docker exec "$CONTAINER" test -e /tmp/aibox-ready 2>/dev/null; do
-    docker exec -u aibox "$CONTAINER" test -x /home/aibox/.local/bin/claude 2>/dev/null && break
-    (( i++ >= 180 )) && break
-    (( i == 3 )) && _info "Waiting for first-time container setup (claude install)..."
-    sleep 1
-  done
-  docker exec -u aibox "$CONTAINER" test -x /home/aibox/.local/bin/claude 2>/dev/null && return 0
+  # Wait (in-container, one exec) until the entrypoint's start-up work is
+  # done — the marker appears even if its install attempt failed. The
+  # binary test doubles as the exit path for containers from older images
+  # that never write a marker. Up to 180s: the first install downloads the
+  # binary.
+  docker exec -u aibox "$CONTAINER" sh -c '
+    i=0
+    until [ -e /tmp/aibox-ready ] || [ -x "$HOME/.local/bin/claude" ]; do
+      i=$((i+1)); [ "$i" -ge 180 ] && break
+      [ "$i" -eq 3 ] && echo "Waiting for first-time container setup (claude install)..." >&2
+      sleep 1
+    done
+    [ -x "$HOME/.local/bin/claude" ]' && return 0
   _info "Installing Claude Code into the shared home volume (one-time)..."
   docker exec -u aibox "$CONTAINER" bash -c 'curl -fsSL https://claude.ai/install.sh | bash' || true
   docker exec -u aibox "$CONTAINER" test -x /home/aibox/.local/bin/claude 2>/dev/null \
-    || _die "Claude Code install failed (network?). Retry, or run: aibox shell 'curl -fsSL https://claude.ai/install.sh | bash'"
+    || _die "Claude Code install failed — see the curl output above. Retry, or run: aibox shell 'curl -fsSL https://claude.ai/install.sh | bash'"
 }
 
 _ensure_all() {
   _ensure_docker
   _ensure_image
   _ensure_container
-  _ensure_proxy
+  _ensure_proxy   # after _ensure_container: the Caddyfile must include the new container
   if [[ "$CREATED" == "true" ]]; then
     _ok "Container ready. Dev servers: http://<port>.$(_pub_label).aibox.localhost$(_proxy_suffix)"
   fi
@@ -428,11 +453,8 @@ _dexec() {
 cmd_claude() {
   _ensure_all
   _ensure_claude_bin
-  local args=() has_skip=false a
-  for a in "$@"; do [[ "$a" == "--dangerously-skip-permissions" ]] && has_skip=true; done
-  [[ "$has_skip" == "false" ]] && args+=(--dangerously-skip-permissions)
-  args+=("$@")
-  _dexec claude "${args[@]}"
+  # Always passed; claude tolerates the flag appearing twice.
+  _dexec claude --dangerously-skip-permissions "$@"
 }
 
 cmd_shell() {
@@ -440,9 +462,9 @@ cmd_shell() {
   if [[ $# -eq 0 ]]; then
     _dexec zsh
   elif [[ $# -eq 1 ]]; then
-    _dexec zsh -lc "$1"
+    _dexec zsh -lc "$1"                      # one arg = shell string: pipes/globs work
   else
-    _dexec zsh -lc "$(printf '%q ' "$@")"
+    _dexec zsh -lc "$(printf '%q ' "$@")"    # several = safely-quoted argv
   fi
 }
 
@@ -451,22 +473,24 @@ cmd_stop() {
   if [[ "${1:-}" == "--all" ]]; then
     # Only containers this tool created (label) plus the proxy — never
     # unrelated containers that happen to be named aibox-*.
-    local names
+    local names slugs
     names="$(docker ps --filter label=aibox.slug --format '{{.Names}}')"
-    if docker ps --format '{{.Names}}' | grep -Fxq "$PROXY"; then
-      names="${names}${names:+
-}${PROXY}"
+    slugs="$(docker ps --filter label=aibox.slug --format '{{.Label "aibox.slug"}}' | sort | tr '\n' ' ')"
+    if [[ "$(_state "$PROXY")" == "running" ]]; then
+      [[ -n "$names" ]] && names+=$'\n'
+      names+="$PROXY"
+      slugs="${slugs}+ proxy "
     fi
     [[ -z "$names" ]] && { _info "No aibox containers running."; return 0; }
     echo "$names" | xargs docker stop >/dev/null
-    _ok "Stopped: $(echo "$names" | tr '\n' ' ')(state preserved)"
+    _ok "Stopped: ${slugs}(state preserved)."
   elif [[ -n "${1:-}" ]]; then
     _die "Usage: aibox stop [--all]"
-  elif docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER"; then
+  elif [[ "$(_state "$CONTAINER")" == "running" ]]; then
     docker stop "$CONTAINER" >/dev/null
-    _ok "Stopped ${CONTAINER} (state preserved — run aibox to start it again)."
+    _ok "Stopped ${SLUG} (state preserved — run aibox to start it again)."
   else
-    _info "Not running: ${CONTAINER}"
+    _info "Not running: ${SLUG}"
   fi
 }
 
@@ -474,26 +498,32 @@ cmd_status() {
   _ensure_docker
   local rows
   rows="$(docker ps -a --filter label=aibox.slug \
-    --format '{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Label "aibox.path"}}' 2>/dev/null)"
+    --format '{{.Label "aibox.slug"}}\t{{.Status}}\t{{.Image}}\t{{.Label "aibox.path"}}\t{{.Names}}' 2>/dev/null)"
   if [[ -z "$rows" ]]; then
     echo "No aibox containers. Run aibox in a project directory to start one."
   else
     local suffix key name
     suffix="$(_proxy_suffix)"
-    printf "%-34s %-18s %-24s %s\n" "CONTAINER" "STATUS" "DEV URL" "PROJECT"
-    while IFS=$'\t' read -r cname cstatus cimage cpath; do
+    printf "%-18s %-22s %-30s %s\n" "PROJECT" "STATUS" "DEV URL" "PATH"
+    while IFS=$'\t' read -r cslug cstatus cimage cpath cname; do
       local url="-"
       while read -r key name; do
         [[ "$name" == "$cname" ]] && url="<port>.${key}.aibox.localhost${suffix}"
       done < <(_proxy_pairs)
-      printf "%-34s %-18s %-24s %s\n" "$cname" "$cstatus" "$url" "$cpath"
-      [[ "$cimage" != "$IMAGE" ]] && _info "  ${cname}: image ${cimage} (current: ${IMAGE} — recreated on next run)"
+      # De-jargon docker's status ("Up 2 hours", "Exited (143) 3 days ago")
+      cstatus="$(echo "$cstatus" | sed 's/^Up /running /; s/^Exited ([0-9]*) /stopped /; s/^Created$/created/')"
+      printf "%-18s %-22s %-30s %s\n" "$cslug" "$cstatus" "$url" "$cpath"
+      [[ "$cimage" != "$IMAGE" ]] && _info "  ${cslug}: image ${cimage} (current: ${IMAGE} — recreated on next run)"
     done <<< "$rows"
   fi
   echo ""
   local pstate
   pstate="$(_state "$PROXY")"
-  echo "Proxy: ${pstate}$( [[ "$pstate" == running ]] && echo " (http://<port>.<project>.aibox.localhost$(_proxy_suffix))" )"
+  if [[ "$pstate" == "running" ]]; then
+    echo "Proxy: running (http://<port>.<project>.aibox.localhost$(_proxy_suffix))"
+  else
+    echo "Proxy: stopped (starts on next aibox run)"
+  fi
   if docker volume inspect "$VOLUME" >/dev/null 2>&1; then
     local size
     size="$(docker run --rm -v "${VOLUME}:/v:ro" "$HELPER_IMAGE" du -sh /v 2>/dev/null | cut -f1 || echo '?')"
@@ -506,13 +536,13 @@ cmd_status() {
 # OFF — a silent failure here once meant restore wiped a volume against a
 # safety backup that didn't exist.
 _do_backup() {
-  local dir="$1" prefix="${2:-aibox-home}"
+  local dir="$1" prefix="${2:-aibox-home}" name
   case "$dir" in *:*)
     echo "backup dir contains ':' — docker cannot mount it: ${dir}" >&2; return 1 ;;
   esac
   mkdir -p "$dir" || return 1
   dir="$(cd "$dir" && pwd)" || return 1
-  local name="${prefix}-${IMG_VER}-$(date -u +%Y%m%d-%H%M%S).tar.gz"
+  name="${prefix}-${VERSION_TAG}-$(date -u +%Y%m%d-%H%M%S).tar.gz" || return 1
   docker run --rm -v "${VOLUME}:/home/aibox:ro" -v "${dir}:/backup" "$HELPER_IMAGE" \
     tar czf "/backup/${name}" -C /home/aibox . >/dev/null || return 1
   [[ -s "${dir}/${name}" ]] || return 1
@@ -525,8 +555,8 @@ cmd_backup() {
     || _die "No ${VOLUME} volume yet — nothing to back up."
   local out
   out="$(_do_backup "${1:-$BACKUP_DIR}")" \
-    || _die "Backup FAILED — nothing was written. Check the destination directory and docker."
-  _ok "Backup written: ${out} ($(du -h "$out" | cut -f1))"
+    || _die "Backup failed — nothing was written (see error above; destination: ${1:-$BACKUP_DIR})."
+  _ok "Backed up ${VOLUME} (sessions, login, claude binary) → ${out} ($(ls -lh "$out" | awk '{print $5}'))"
 }
 
 cmd_restore() {
@@ -542,12 +572,13 @@ cmd_restore() {
   # fixed path — its name never reaches a shell string.
   docker run --rm -v "${file}:/backup.tar.gz:ro" "$HELPER_IMAGE" \
     tar tzf /backup.tar.gz >/dev/null 2>&1 \
-    || _die "Not a readable .tar.gz archive: ${file}"
+    || _die "Not a readable .tar.gz archive: ${file} — nothing was changed."
 
   echo "This replaces the contents of ${VOLUME} (sessions, login, claude binary)"
   echo "with: ${file}"
-  echo "A safety backup of the current state is taken first."
-  _confirm "Restore?" || { echo "Aborted."; return 0; }
+  echo "A safety backup is taken first; running aibox containers are stopped"
+  echo "and restarted around the restore."
+  _confirm "Restore?" || { echo "Aborted — nothing was changed."; return 0; }
 
   local running
   running="$(docker ps --filter "volume=${VOLUME}" --format '{{.Names}}')"
@@ -561,20 +592,19 @@ cmd_restore() {
   if [[ -n "$has_data" ]]; then
     local safety
     safety="$(_do_backup "$BACKUP_DIR" "aibox-home-pre-restore")" \
-      || _die "Safety backup FAILED — aborting restore. The volume is untouched."
+      || _die "Safety backup failed — aborting restore. The volume is untouched."
     _ok "Safety backup: ${safety}"
   fi
 
   docker run --rm -v "${VOLUME}:/v" -v "${file}:/backup.tar.gz:ro" "$HELPER_IMAGE" \
     sh -c 'find /v -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar xzf /backup.tar.gz -C /v' \
     || _die "Restore failed mid-way. Recover with: aibox restore <the safety backup above>"
-  _ok "Restored."
+  _ok "Restored ${VOLUME} from $(basename "$file")."
 
   if [[ -n "$running" ]]; then
     echo "$running" | xargs docker start >/dev/null
     _ok "Restarted: $(echo "$running" | tr '\n' ' ')"
   fi
-  return 0
 }
 
 cmd_update() {
@@ -596,7 +626,7 @@ cmd_update() {
 }
 
 cmd_version() {
-  echo "aibox v${CLI_VERSION} (image ${IMAGE})"
+  echo "aibox v${VERSION_TAG} (image ${IMAGE})"
   if command -v docker >/dev/null 2>&1; then
     local daemon="daemon not running"
     docker info >/dev/null 2>&1 && daemon="daemon running"
@@ -614,7 +644,6 @@ cmd_help() {
 _check_for_updates() {
   [[ ! -t 1 || -n "${CI:-}" || "$CLI_VERSION" == "__CLI_VERSION__" ]] && return 0
   local cache="${CONFIG_DIR}/update-check"
-  mkdir -p "$CONFIG_DIR"
   if [[ -f "$cache" ]]; then
     local mtime latest
     mtime="$(stat -c %Y "$cache" 2>/dev/null || stat -f %m "$cache" 2>/dev/null || echo 0)"
@@ -627,8 +656,7 @@ _check_for_updates() {
   fi
   ( curl -fsSL --max-time 3 "https://registry.npmjs.org/aibox-cli/latest" 2>/dev/null \
       | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 > "$cache"
-  ) &>/dev/null &
-  disown 2>/dev/null || true
+  ) >/dev/null 2>&1 &
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────
@@ -647,10 +675,5 @@ case "$CMD" in
   version|-v|--version) cmd_version ;;
   help|-h|--help)       cmd_help ;;
   -*)                   cmd_claude "$CMD" "$@" ;;
-  *)
-    echo "Unknown command: $CMD" >&2
-    echo "" >&2
-    cmd_help >&2
-    exit 1
-    ;;
+  *)                    _die "Unknown command: ${CMD}. Run 'aibox help' for usage." ;;
 esac

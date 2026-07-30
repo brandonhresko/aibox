@@ -16,6 +16,8 @@ To test locally, symlink into your PATH:
 ln -sf "$(pwd)/bin/aibox" /usr/local/bin/aibox
 ```
 
+Dev-mode note: a checkout runs as version `dev`, so the image tag doesn't change between your edits — after modifying the embedded Dockerfile or entrypoint, force a rebuild with `docker rmi aibox:dev-node<version>` (releases bump the tag, so users get rebuilds automatically).
+
 ## Publishing
 
 Publishing is fully automated. Pushing a version tag triggers CI which creates a GitHub release, publishes to npm, and updates the Homebrew tap.

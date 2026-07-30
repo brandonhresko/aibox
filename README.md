@@ -81,7 +81,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 | `aibox backup [dir]` | Snapshot the home volume to a tar.gz |
 | `aibox restore <file>` | Restore a backup (safety-backup of current state first) |
 | `aibox update` | Update the CLI; image rebuilds automatically on next run |
-| `aibox version` / `help` | |
+| `aibox version` / `help` | Versions + docker state / this table's long form |
 
 ## Config
 
@@ -97,7 +97,7 @@ The image is `node:<version>-bookworm` (Debian) plus a few basics (zsh, sudo, ri
 
 ## Prerequisites
 
-Docker via [Colima](https://github.com/abiosoft/colima), [OrbStack](https://orbstack.dev), or [Docker Desktop](https://www.docker.com/products/docker-desktop/):
+Built for macOS; works on Linux too (any running Docker daemon). On macOS, Docker via [Colima](https://github.com/abiosoft/colima), [OrbStack](https://orbstack.dev), or [Docker Desktop](https://www.docker.com/products/docker-desktop/):
 
 ```bash
 brew install colima docker && colima start

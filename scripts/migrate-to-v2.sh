@@ -5,26 +5,27 @@
 # Usage:
 #   ./migrate-to-v2.sh [--map OLD_PATH=NEW_PATH]... [old-backup-dir ...]
 #
-# What it does, in order:
-#   1. Creates the aibox-home volume if missing.
-#   2. Merges every `aibox-auth-*` Docker volume (v1 kept one per image
+# Steps (numbered like the sections below; the volume is created first if
+# missing):
+#   1. Merges every `aibox-auth-*` Docker volume (v1 kept one per image
 #      string) into aibox-home. Sources are mounted READ-ONLY and are never
 #      modified or deleted.
-#   3. Merges any old backup folders passed as arguments. Two layouts are
+#   2. Merges any old backup folders passed as arguments. Two layouts are
 #      accepted: a folder that *is* a Claude config dir (contains
 #      .claude.json / projects/), or a folder containing a `.claude/` dir
 #      (with .claude.json beside or inside it).
-#   4. Session/state files merge file-by-file, no-clobber (each session is
-#      its own .jsonl keyed by UUID, so a plain union is correct).
-#      `.claude.json` is special-cased: the newest copy is the base, and the
+#   3. Merges `.claude.json`: the newest copy is the base, and the
 #      `projects` map is merged across all copies with newest-wins per key.
-#   5. `--map OLD=NEW` rekeys sessions recorded under a container-side path
+#      (All other files merge file-by-file, no-clobber — each session is
+#      its own .jsonl keyed by UUID, so a plain union is correct.)
+#   4. `--map OLD=NEW` rekeys sessions recorded under a container-side path
 #      (v1 --copy/--worktree used /workspace/...) to a real host path, e.g.
 #      --map /workspace/myapp=/Users/me/code/myapp. Renames both the
 #      projects/<escaped-path> directories and the .claude.json keys.
 #      Matching respects path boundaries (/workspace/myapp does not match
 #      /workspace/myapp2), but escaping is lossy — /a/b, /a.b and /a-b all
 #      escape identically — so only use --map for paths you recognize.
+#   5. Normalizes ownership to uid 1000 (the v2 container user).
 #
 # Idempotent: run it twice and the second run copies nothing new. Merges
 # never overwrite an existing file, and nothing in the destination is
@@ -48,6 +49,8 @@ command -v docker >/dev/null 2>&1 || die "docker not found"
 docker info >/dev/null 2>&1 || die "Docker daemon not running"
 command -v python3 >/dev/null 2>&1 || die "python3 not found (needed for the .claude.json merge)"
 
+# Must byte-match Claude Code's own project-path escaping (used for
+# projects/<escaped-cwd> dir names) — do not "improve" its lossiness.
 escape() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
 
 # ── Args ─────────────────────────────────────────────────────────
@@ -86,6 +89,9 @@ docker run --rm -v "${VOLUME}:/dst" "$HELPER_IMAGE" mkdir -p /dst/.claude
 # ── Helpers ──────────────────────────────────────────────────────
 # --map pairs in escaped form ("old=new;old2=new2") so the copy step can
 # land files directly at their mapped path (keeps re-runs copy-free).
+# ';' and '=' are safe separators: escaped keys contain only [a-zA-Z0-9-].
+# (${arr[@]+"${arr[@]}"} throughout: empty-array expansion is an error
+# under set -u on macOS bash 3.2.)
 ESC_MAPS=""
 for m in ${MAPS[@]+"${MAPS[@]}"}; do
   ESC_MAPS="${ESC_MAPS}$(escape "${m%%=*}")=$(escape "${m#*=}");"
@@ -120,7 +126,7 @@ true_count=$(find . \( -type f -o -type l \) -exec printf x \; | wc -c)
   || echo "WARNING: source has file names containing newlines - those files are NOT copied" >&2
 find . \( -type f -o -type l \) ! -path "./.claude.json" | while IFS= read -r f; do
   s="${f#./}"
-  [ -e "./$s" ] || [ -L "./$s" ] || continue
+  [ -e "./$s" ] || [ -L "./$s" ] || continue   # newline-split fragment of a bad name
   d="$(map_path "$s")"
   if [ ! -e "/dst/.claude/$d" ] && [ ! -L "/dst/.claude/$d" ]; then
     mkdir -p "/dst/.claude/$(dirname "$d")" \
@@ -131,7 +137,9 @@ find . \( -type f -o -type l \) ! -path "./.claude.json" | while IFS= read -r f;
   fi
 done | wc -l'
 
-# Save one source .claude.json into staging as <mtime>.<n>.json
+# Save one source .claude.json into staging as <mtime>.<n>.json — this
+# filename is the wire format parsed by the Python merge step below.
+# mtime 0 is the "file absent" sentinel (see host_mtime and _read_json).
 JSON_N=0
 stage_json() {  # $1 = mtime, stdin = content
   local content
@@ -141,17 +149,24 @@ stage_json() {  # $1 = mtime, stdin = content
   printf '%s' "$content" > "${STAGING}/${1}.${JSON_N}.json"
 }
 
+_copy_into_dst() {  # $1 = docker mount source (volume name or host dir)
+  docker run --rm -e ESC_MAPS="$ESC_MAPS" -v "${1}:/src:ro" -v "${VOLUME}:/dst" \
+    "$HELPER_IMAGE" sh -c "$COPY_SCRIPT"
+}
+
+_read_json() {  # $1 = mount source, $2 = .claude.json path inside it → "mtime\ncontent"
+  docker run --rm -v "${1}:/src:ro" "$HELPER_IMAGE" sh -c \
+    "stat -c %Y '/src/${2}' 2>/dev/null || echo 0; cat '/src/${2}' 2>/dev/null || true"
+}
+
 merge_from_volume() {  # $1 = volume name
   local vol="$1" copied meta content
-  copied="$(docker run --rm -e ESC_MAPS="$ESC_MAPS" -v "${vol}:/src:ro" -v "${VOLUME}:/dst" "$HELPER_IMAGE" sh -c "$COPY_SCRIPT")"
-  meta="$(docker run --rm -v "${vol}:/src:ro" "$HELPER_IMAGE" sh -c \
-    'stat -c %Y /src/.claude.json 2>/dev/null || echo 0')"
-  content="$(docker run --rm -v "${vol}:/src:ro" "$HELPER_IMAGE" sh -c \
-    'cat /src/.claude.json 2>/dev/null || true')"
+  copied="$(_copy_into_dst "$vol")"
+  { read -r meta; content="$(cat)"; } <<< "$(_read_json "$vol" .claude.json)"
   # Not a pipeline: stage_json must run in this shell so JSON_N increments
   # (same-mtime sources would otherwise overwrite each other in staging).
   stage_json "$meta" <<< "$content"
-  ok "volume ${vol}: ${copied// /} new file(s)"
+  ok "volume ${vol}: ${copied// /} new file(s)"   # wc pads with spaces on some platforms
 }
 
 host_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
@@ -172,7 +187,7 @@ merge_from_dir() {  # $1 = backup dir
     return 0
   fi
   local copied
-  copied="$(docker run --rm -e ESC_MAPS="$ESC_MAPS" -v "${src}:/src:ro" -v "${VOLUME}:/dst" "$HELPER_IMAGE" sh -c "$COPY_SCRIPT")"
+  copied="$(_copy_into_dst "$src")"
   for j in ${jsons[@]+"${jsons[@]}"}; do
     stage_json "$(host_mtime "$j")" < "$j"
   done
@@ -199,10 +214,7 @@ done
 # volume root is /home/aibox, so the live file sits at .claude/.claude.json
 # relative to the volume root — without this, a re-run after using v2 would
 # rebuild the file from old sources only and lose v2-era state.
-DST_META="$(docker run --rm -v "${VOLUME}:/v:ro" "$HELPER_IMAGE" sh -c \
-  'stat -c %Y /v/.claude/.claude.json 2>/dev/null || echo 0')"
-DST_CONTENT="$(docker run --rm -v "${VOLUME}:/v:ro" "$HELPER_IMAGE" sh -c \
-  'cat /v/.claude/.claude.json 2>/dev/null || true')"
+{ read -r DST_META; DST_CONTENT="$(cat)"; } <<< "$(_read_json "$VOLUME" .claude/.claude.json)"
 stage_json "$DST_META" <<< "$DST_CONTENT"
 
 if ls "${STAGING}"/*.json >/dev/null 2>&1; then
@@ -238,6 +250,8 @@ for old, new in maps:
     for key in list(projects):
         if key == old or key.startswith(old + "/"):
             newkey = new + key[len(old):] if key != old else new
+            # setdefault: on a collision the existing (new-path) entry wins
+            # and the popped one is dropped — same no-clobber rule as files.
             projects.setdefault(newkey, projects.pop(key))
 base["projects"] = projects
 with open(os.path.join(staging, "merged.out"), "w") as f:
@@ -254,8 +268,10 @@ else
 fi
 
 # ── 4. --map: rename session directories already in the volume ───
-# (New copies are mapped at copy time; this handles data that landed in the
-# volume before the map was applied, e.g. an earlier migration run.)
+# New copies are mapped at copy time; this handles data that landed in the
+# volume before the map was applied (an earlier migration run). It must
+# stay: step 3 rekeys .claude.json unconditionally, so leaving old dirs
+# unmoved would orphan those sessions (key/dir mismatch).
 # Safety rules: never touch a dir that IS the target or is itself a mapped
 # target; move whole entries no-clobber; delete a leftover file only when it
 # is byte-identical to the copy at the target; leave anything else in place
@@ -308,17 +324,15 @@ echo "Verify with:  cd <a project> && aibox claude --resume"
 echo ""
 echo "Nothing was deleted. Once you've verified v2 sees your sessions, clean up"
 echo "the old v1 resources manually:"
+# v1 labels: aibox.instance = project containers, aibox.pf.target = socat
+# port-forward helpers. Docker names contain no whitespace, so unquoted
+# expansion into printf is safe.
 V1_CONTAINERS="$(docker ps -a --filter label=aibox.instance --format '{{.Names}}' || true)"
-V1_PF="$(docker ps -a --filter label=aibox.pf.target --format '{{.Names}}' || true)"
-if [[ -n "$V1_CONTAINERS" ]]; then
-  while IFS= read -r c; do echo "  docker rm -f ${c}"; done <<< "$V1_CONTAINERS"
-fi
-if [[ -n "$V1_PF" ]]; then
-  while IFS= read -r c; do echo "  docker rm -f ${c}"; done <<< "$V1_PF"
-fi
-if [[ -n "$AUTH_VOLS" ]]; then
-  while IFS= read -r v; do echo "  docker volume rm ${v}"; done <<< "$AUTH_VOLS"
-fi
-if [[ -z "$V1_CONTAINERS" && -z "$V1_PF" && -z "$AUTH_VOLS" ]]; then
-  echo "  (none found)"
-fi
+V1_PORTFWD="$(docker ps -a --filter label=aibox.pf.target --format '{{.Names}}' || true)"
+# shellcheck disable=SC2086
+{
+  [[ -n "$V1_CONTAINERS$V1_PORTFWD" ]] && printf '  docker rm -f %s\n' $V1_CONTAINERS $V1_PORTFWD
+  [[ -n "$AUTH_VOLS" ]] && printf '  docker volume rm %s\n' $AUTH_VOLS
+  [[ -z "$V1_CONTAINERS$V1_PORTFWD$AUTH_VOLS" ]] && echo "  (none found)"
+  true
+}
