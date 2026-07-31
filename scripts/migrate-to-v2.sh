@@ -259,8 +259,11 @@ with open(os.path.join(staging, "merged.out"), "w") as f:
 print(f"· merged .claude.json from {len(sources)} source(s), {len(projects)} project(s)")
 PY
   if [[ -f "${STAGING}/merged.out" ]]; then
-    docker run --rm -v "${STAGING}:/stage:ro" -v "${VOLUME}:/dst" "$HELPER_IMAGE" \
-      sh -c 'cp /stage/merged.out /dst/.claude/.claude.json && chmod 600 /dst/.claude/.claude.json'
+    # Pipe via stdin, don't bind-mount: $STAGING is under macOS's /var/folders,
+    # which Colima doesn't share into its VM (the mount appears empty there).
+    docker run --rm -i -v "${VOLUME}:/dst" "$HELPER_IMAGE" \
+      sh -c 'cat > /dst/.claude/.claude.json && chmod 600 /dst/.claude/.claude.json' \
+      < "${STAGING}/merged.out"
     ok "wrote merged .claude.json"
   fi
 else
