@@ -62,9 +62,9 @@ These were decided explicitly; the rewrite must not relitigate them.
 | D1 | Language / distribution | Single bash file, published to npm as `aibox-cli` (same as today) | New scope is ~500 lines, not 2,400; zero runtime deps beyond Docker |
 | D2 | Security posture | Permission prompts on by default with bypass selectable in-session (`--allow-dangerously-skip-permissions`); `aibox --yolo` starts in bypass (`--dangerously-skip-permissions`). No firewall, no restricted sudo | Isolation comes from the container boundary itself; the prompt default is the only mode switch |
 | D3 | Container lifecycle | Container **keeps running in the background** when the last session exits. `aibox stop` stops it explicitly. It is only ever *removed* when the image changes (and then only recreated, never left absent) | Instant re-attach; idle containers cost ~nothing; kills the data-loss footgun |
-| D4 | Instances | Exactly one container per project directory; multiple terminals just `exec` into the same container. No named instances | Matches real usage |
+| D4 | Instances | Exactly one persistent container per project directory; multiple terminals just `exec` into the same container. No named instances. `--copy` additionally spawns a disposable container per run (unique name, removed on exit) | Matches real usage; disposable runs must not fight over one name |
 | D5 | Session/home storage | One **global** named volume `aibox-home` mounted at `/home/aibox`, shared by all project containers | One login, one session history, one thing to back up; survives image changes by construction |
-| D6 | Project mount | Bind-mount the project directory at **the same absolute path as on the host** (today's default-mode behavior, `bin/aibox:475`) | Claude session keys are derived from cwd — keeping the path keeps every existing session valid with zero migration |
+| D6 | Project mount | Bind-mount the project directory at **the same absolute path as on the host** (today's default-mode behavior, `bin/aibox:475`). `--copy` skips the bind mount and `docker cp`s a snapshot to the same path instead | Claude session keys are derived from cwd — keeping the path keeps every existing session valid with zero migration (copy mode included, since the path matches) |
 | D7 | Backup | Built-in `aibox backup` / `aibox restore` — clean and simple, must actually work | Replaces the external script |
 | D8 | Migration of old data | A **separate standalone script** (not part of the CLI) that merges both live `aibox-auth-*` volumes **and** old backup folders into the new `aibox-home` volume | One-time operation; keeps the CLI clean |
 | D9 | Dev-server access | Host-side reverse proxy with wildcard subdomains: `http://<port>.<project>.aibox.localhost` → container port. Replaces port-forward sidecars and ad-hoc Cloudflare tunnels for local use | `*.localhost` (multi-level included) resolves to loopback natively in Chrome/Edge and Firefox 84+ with zero setup, no sudo, no dnsmasq; Safari only gained this on macOS 26 Tahoe (WebKit bug 160504). CLI tools using the system resolver (curl) don't resolve it — documented workaround, not solved. `/etc/hosts` can't do wildcards, so there is no hosts-file step |
@@ -75,7 +75,7 @@ These were decided explicitly; the rewrite must not relitigate them.
 
 ```
 aibox                      # same as `aibox claude`
-aibox claude [args...]     # ensure image/container/proxy, then run claude inside; --yolo skips all prompts, other args pass through (--resume, -c, etc.)
+aibox claude [args...]     # ensure image/container/proxy, then run claude inside; --yolo skips all prompts, --copy uses a disposable snapshot container, other args pass through (--resume, -c, etc.)
 aibox shell [cmd...]       # zsh in the container, or run a one-off command
 aibox stop [--all]         # stop this project's container (--all: every aibox container + proxy). Never deletes anything
 aibox status               # all aibox containers: project, state, uptime, image; proxy URLs; volume size
@@ -171,6 +171,13 @@ aibox claude/shell:
 - `claude` is invoked with `--allow-dangerously-skip-permissions` (prompts
   on, bypass selectable in-session) plus any passthrough args; `--yolo`
   swaps that for `--dangerously-skip-permissions` (all prompts skipped).
+- `--copy` runs claude in a disposable container instead: fresh container
+  per run (`<container>-copy-<rand>`, no restart policy, labeled
+  `aibox.copy=1` with slug `<slug>-copy` for its own dev URLs), no bind
+  mount — the project is `docker cp`'d to the same absolute path and
+  chowned. It shares the home volume, so login and session history work,
+  and the container is removed on exit (EXIT trap; work is kept by
+  committing/pushing from inside).
 - **Nothing happens on session exit.** No idle-detection, no auto-stop, no
   down. The container idles at ~zero CPU until the next attach or an
   explicit `aibox stop`.
@@ -369,8 +376,9 @@ Removed entirely, with no deprecation shims — v2 is a clean break
 - Commands: `up`, `down`, `build`, `init`, `port-forward`, `volumes`,
   `disk`, `clean`, `nuke`, `doctor`.
 - Flags: `-n/--name`, `-r/--repo`, `-b/--branch`, `-c/--copy`,
-  `-w/--worktree`, `-y/--yolo` (v2 keeps only the long `--yolo` spelling,
-  now meaning claude's bypass-permissions flag), `-s/--safe`,
+  `-w/--worktree`, `-y/--yolo` and `-c/--copy` (v2 keeps only the long
+  `--yolo` / `--copy` spellings: claude's bypass-permissions flag and the
+  disposable snapshot container), `-s/--safe`,
   `-i/--image`, `--all`/`--clean` on `down`.
 - Mechanisms: compose orchestration (v1 pipes generated YAML into
   `docker compose -f -`) and the JetBrains-facing `compose.dev.yaml`, socat

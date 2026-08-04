@@ -9,6 +9,11 @@
 #                             Claude Code. Permission prompts are on by
 #                             default, with bypass mode available in-session;
 #                             pass --yolo to skip all prompts from the start.
+#                             Pass --copy for a disposable container on a
+#                             snapshot of the project instead — no bind
+#                             mount, the real directory can't be touched,
+#                             and the container is removed on exit (commit &
+#                             push from inside to keep work).
 #                             Other args pass to claude verbatim (--resume,
 #                             -p, --model, ...). `aibox --resume` works too.
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
@@ -450,21 +455,74 @@ _dexec() {
   docker exec "${tty_args[@]}" -u aibox -w "$PROJECT_DIR" "${env_args[@]}" "$CONTAINER" "$@"
 }
 
+# ── Disposable copy container (--copy) ───────────────────────────
+# A fresh container per run on a snapshot of the project — no bind mount, so
+# the real directory cannot be touched from inside. Shares the home volume
+# (login, sessions, claude binary) and gets its own dev URLs under
+# <slug>-copy. Removed when the session exits; work is kept by committing
+# and pushing from inside before exiting.
+
+_cleanup_copy() {
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  # Drop the copy's proxy route; only touch a proxy that is already running.
+  { [[ "$(_state "$PROXY")" == "running" ]] && _ensure_proxy >/dev/null 2>&1; } || true
+}
+
+_ensure_copy_all() {
+  _ensure_docker
+  _ensure_image
+  _require_safe_dir
+  docker network create "$NETWORK" >/dev/null 2>&1 || true
+  docker volume create "$VOLUME" >/dev/null 2>&1 || true
+  # Unique name per run: concurrent --copy sessions are separate sandboxes.
+  # The trailing random segment doubles as the URL suffix if slugs collide
+  # (see _proxy_pairs). No --restart policy: disposable by design.
+  CONTAINER="${CONTAINER}-copy-$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
+  trap _cleanup_copy EXIT
+  docker run -d --name "$CONTAINER" \
+    --network "$NETWORK" \
+    --init \
+    --add-host host.docker.internal:host-gateway \
+    -v "${VOLUME}:/home/aibox" \
+    -w "$PROJECT_DIR" \
+    -e CLAUDE_CONFIG_DIR=/home/aibox/.claude \
+    -l "aibox.slug=${SLUG}-copy" \
+    -l "aibox.path=${PROJECT_DIR}" \
+    -l "aibox.copy=1" \
+    "$IMAGE" >/dev/null
+  local i=0
+  until [[ "$(docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null)" == "true" ]]; do
+    (( i++ >= 25 )) && _die "Copy container failed to start."   # 5s
+    sleep 0.2
+  done
+  _info "Snapshotting project into the container (the real ${PROJECT_DIR} is not mounted)..."
+  docker cp "${PROJECT_DIR}/." "${CONTAINER}:${PROJECT_DIR}" || _die "Project snapshot failed."
+  docker exec -u root "$CONTAINER" chown -R aibox:aibox "$PROJECT_DIR"
+  _ensure_proxy
+  _ok "Disposable copy ready — removed on exit; commit & push from inside to keep work. Dev servers: http://<port>.$(_pub_label).aibox.localhost$(_proxy_suffix)"
+}
+
 # ── Commands ─────────────────────────────────────────────────────
 cmd_claude() {
-  _ensure_all
-  _ensure_claude_bin
   # --yolo → bypass permissions from the start; without it, bypass is
   # available in-session (claude's allow flag) but permissions default on.
-  local perm_flag=--allow-dangerously-skip-permissions
+  # --copy → disposable snapshot container instead of the persistent
+  # bind-mounted one.
+  local perm_flag=--allow-dangerously-skip-permissions copy=false
   local args=() a
   for a in "$@"; do
-    if [[ "$a" == "--yolo" ]]; then
-      perm_flag=--dangerously-skip-permissions
-    else
-      args+=("$a")
-    fi
+    case "$a" in
+      --yolo) perm_flag=--dangerously-skip-permissions ;;
+      --copy) copy=true ;;
+      *)      args+=("$a") ;;
+    esac
   done
+  if [[ "$copy" == "true" ]]; then
+    _ensure_copy_all
+  else
+    _ensure_all
+  fi
+  _ensure_claude_bin
   _dexec claude "$perm_flag" ${args[@]+"${args[@]}"}
 }
 
