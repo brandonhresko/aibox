@@ -1,7 +1,7 @@
 # aibox v2 — Revamp Requirements
 
 Requirements for rewriting aibox around how it is actually used: one trusted
-machine, one user, Claude Code in yolo mode, containers that are cheap to
+machine, one user, Claude Code in a sandbox, containers that are cheap to
 enter and impossible to lose data in.
 
 This document is the spec for the rewrite. It records the decisions already
@@ -60,7 +60,7 @@ These were decided explicitly; the rewrite must not relitigate them.
 | # | Decision | Choice | Rationale |
 |---|----------|--------|-----------|
 | D1 | Language / distribution | Single bash file, published to npm as `aibox-cli` (same as today) | New scope is ~500 lines, not 2,400; zero runtime deps beyond Docker |
-| D2 | Security posture | Always yolo. No safe mode, no firewall, no restricted sudo | Isolation comes from the container boundary itself; the modes were never used |
+| D2 | Security posture | Permission prompts on by default with bypass selectable in-session (`--allow-dangerously-skip-permissions`); `aibox --yolo` starts in bypass (`--dangerously-skip-permissions`). No firewall, no restricted sudo | Isolation comes from the container boundary itself; the prompt default is the only mode switch |
 | D3 | Container lifecycle | Container **keeps running in the background** when the last session exits. `aibox stop` stops it explicitly. It is only ever *removed* when the image changes (and then only recreated, never left absent) | Instant re-attach; idle containers cost ~nothing; kills the data-loss footgun |
 | D4 | Instances | Exactly one container per project directory; multiple terminals just `exec` into the same container. No named instances | Matches real usage |
 | D5 | Session/home storage | One **global** named volume `aibox-home` mounted at `/home/aibox`, shared by all project containers | One login, one session history, one thing to back up; survives image changes by construction |
@@ -75,7 +75,7 @@ These were decided explicitly; the rewrite must not relitigate them.
 
 ```
 aibox                      # same as `aibox claude`
-aibox claude [args...]     # ensure image/container/proxy, then run claude (yolo) inside; extra args pass through (--resume, -c, etc.)
+aibox claude [args...]     # ensure image/container/proxy, then run claude inside; --yolo skips all prompts, other args pass through (--resume, -c, etc.)
 aibox shell [cmd...]       # zsh in the container, or run a one-off command
 aibox stop [--all]         # stop this project's container (--all: every aibox container + proxy). Never deletes anything
 aibox status               # all aibox containers: project, state, uptime, image; proxy URLs; volume size
@@ -168,8 +168,9 @@ aibox claude/shell:
   docker exec -it <container> <claude|zsh> ...
 ```
 
-- `claude` is invoked with `--dangerously-skip-permissions` plus any
-  passthrough args.
+- `claude` is invoked with `--allow-dangerously-skip-permissions` (prompts
+  on, bypass selectable in-session) plus any passthrough args; `--yolo`
+  swaps that for `--dangerously-skip-permissions` (all prompts skipped).
 - **Nothing happens on session exit.** No idle-detection, no auto-stop, no
   down. The container idles at ~zero CPU until the next attach or an
   explicit `aibox stop`.
@@ -275,7 +276,7 @@ no commands, no restarts, no sidecars, no tunnels.
   Colima/OrbStack emulate loopback-only publishing by binding `0.0.0.0` and
   rejecting non-loopback sources (old Colima versions ignored the loopback
   restriction entirely, exposing the port on the LAN — acceptable here
-  since everything behind it is already yolo-mode dev traffic, but worth a
+  since everything behind it is already sandboxed dev traffic, but worth a
   line in the README).
 - Non-goals: HTTPS (plain http on loopback is fine), public sharing
   (Cloudflare tunnels remain possible manually; a built-in `aibox share` is
@@ -368,7 +369,8 @@ Removed entirely, with no deprecation shims — v2 is a clean break
 - Commands: `up`, `down`, `build`, `init`, `port-forward`, `volumes`,
   `disk`, `clean`, `nuke`, `doctor`.
 - Flags: `-n/--name`, `-r/--repo`, `-b/--branch`, `-c/--copy`,
-  `-w/--worktree`, `-y/--yolo` (now the only behavior), `-s/--safe`,
+  `-w/--worktree`, `-y/--yolo` (v2 keeps only the long `--yolo` spelling,
+  now meaning claude's bypass-permissions flag), `-s/--safe`,
   `-i/--image`, `--all`/`--clean` on `down`.
 - Mechanisms: compose orchestration (v1 pipes generated YAML into
   `docker compose -f -`) and the JetBrains-facing `compose.dev.yaml`, socat
@@ -416,7 +418,7 @@ Recorded post-implementation; intentional:
 The rewrite is done when all of these hold:
 
 1. `cd proj && aibox` on a fresh machine (Docker present): builds image,
-   creates volume/network/container/proxy, lands in a yolo Claude session.
+   creates volume/network/container/proxy, lands in a Claude session.
 2. Exit Claude, run `aibox claude` again → re-attached in under a second;
    `apt install imagemagick` from a previous session is still installed.
 3. Two terminal tabs, same project: both `aibox claude` concurrently → two

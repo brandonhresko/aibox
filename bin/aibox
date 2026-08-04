@@ -6,10 +6,11 @@
 #
 # Usage:
 #   aibox [claude] [args...]  Start/attach this project's container and run
-#                             Claude Code with no permission prompts — the
-#                             container is the sandbox. Extra args pass to
-#                             claude verbatim (--resume, -p, --model, ...).
-#                             `aibox --resume` also works.
+#                             Claude Code. Permission prompts are on by
+#                             default, with bypass mode available in-session;
+#                             pass --yolo to skip all prompts from the start.
+#                             Other args pass to claude verbatim (--resume,
+#                             -p, --model, ...). `aibox --resume` works too.
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
 #                             shell string (pipes/globs work); several run
 #                             as a safely-quoted command.
@@ -453,8 +454,18 @@ _dexec() {
 cmd_claude() {
   _ensure_all
   _ensure_claude_bin
-  # Always passed; claude tolerates the flag appearing twice.
-  _dexec claude --dangerously-skip-permissions "$@"
+  # --yolo → bypass permissions from the start; without it, bypass is
+  # available in-session (claude's allow flag) but permissions default on.
+  local perm_flag=--allow-dangerously-skip-permissions
+  local args=() a
+  for a in "$@"; do
+    if [[ "$a" == "--yolo" ]]; then
+      perm_flag=--dangerously-skip-permissions
+    else
+      args+=("$a")
+    fi
+  done
+  _dexec claude "$perm_flag" ${args[@]+"${args[@]}"}
 }
 
 cmd_shell() {

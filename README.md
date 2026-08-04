@@ -8,13 +8,13 @@
   </p>
 </p>
 
-> *One command into a yolo-mode Claude Code sandbox. Nothing gets destroyed behind your back.*
+> *One command into a sandboxed Claude Code. Nothing gets destroyed behind your back.*
 
 ```bash
 cd myproject && aibox
 ```
 
-aibox runs Claude Code with `--dangerously-skip-permissions` inside a Docker container, so the agent can run wild while your Mac stays clean. One container per project, all sharing a single persistent home volume — one login, one session history, everything survives.
+aibox runs Claude Code inside a Docker container, so the agent can run wild while your Mac stays clean. Add `--yolo` to skip all permission prompts. One container per project, all sharing a single persistent home volume — one login, one session history, everything survives.
 
 ## Quickstart
 
@@ -30,7 +30,7 @@ aibox                       # 3. run (builds the image on first use)
 - **Your project is bind-mounted at its real path.** Changes sync both ways, paths inside the container match your Mac.
 - **One shared home volume (`aibox-home`).** Claude login, every session, shell history, and the `claude` binary itself live in a Docker volume mounted at `/home/aibox` in every container. Log in once, resume any session from any project, forever.
 - **Nothing is destroyed implicitly.** Exiting Claude leaves the container running in the background (idle containers cost ~nothing) — the next `aibox` attaches instantly. `aibox stop` stops it; a stopped container keeps everything, including packages you apt-installed. Containers are only recreated when the image changes, and the home volume survives even that.
-- **Always yolo.** The container *is* the sandbox. No permission prompts, full sudo inside.
+- **The container is the sandbox.** Full sudo inside. Permission prompts are on by default, but bypass mode is always available in-session (aibox passes claude's `--allow-dangerously-skip-permissions`); run `aibox --yolo` to start with all prompts skipped (`--dangerously-skip-permissions`).
 
 ## Dev servers
 
@@ -58,7 +58,7 @@ Backups are safe to take while sessions are running.
 
 ## Migrating from aibox v1
 
-v2 is a clean break: one always-yolo container per project, one shared home volume, and no destructive lifecycle. A standalone script merges all your v1 data — every per-image `aibox-auth-*` volume **and** any old backup folders — into the new volume:
+v2 is a clean break: one container per project, one shared home volume, and no destructive lifecycle. A standalone script merges all your v1 data — every per-image `aibox-auth-*` volume **and** any old backup folders — into the new volume:
 
 ```bash
 # npm installs ship the script next to the CLI:
@@ -74,7 +74,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 
 | Command | What it does |
 |---------|-------------|
-| `aibox` / `aibox claude [args]` | Start/attach the project container, run Claude Code (yolo). Args pass through verbatim (`--resume`, `-p`, ...). `aibox --resume` works too |
+| `aibox` / `aibox claude [args]` | Start/attach the project container, run Claude Code. `--yolo` skips all permission prompts; other args pass through verbatim (`--resume`, `-p`, ...). `aibox --resume` works too |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
 | `aibox stop [--all]` | Stop this project's container (`--all`: everything incl. proxy). Loses nothing |
 | `aibox status` | Containers, dev URLs, home volume size |
@@ -105,7 +105,7 @@ brew install colima docker && colima start
 
 aibox auto-starts an installed-but-stopped runtime; it won't install one for you.
 
-Note on the dev-server proxy port: the proxy asks Docker for `127.0.0.1:80` only, but some Colima versions ignore the loopback restriction and publish the port on your LAN. Everything behind it is your own yolo-mode dev traffic, but if that matters to you, keep Colima current (or use OrbStack/Docker Desktop).
+Note on the dev-server proxy port: the proxy asks Docker for `127.0.0.1:80` only, but some Colima versions ignore the loopback restriction and publish the port on your LAN. Everything behind it is your own sandboxed dev traffic, but if that matters to you, keep Colima current (or use OrbStack/Docker Desktop).
 
 ## Contributing
 
