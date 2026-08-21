@@ -399,7 +399,7 @@ _ensure_net_vol() {
 _docker_run() {
   docker run -d --name "$CONTAINER" \
     --network "$NETWORK" \
-    --hostname "$SLUG" \
+    --hostname "${SLUG:0:63}" \
     --init \
     --add-host host.docker.internal:host-gateway \
     --mount "type=volume,src=${VOLUME},dst=/home/aibox,volume-subpath=projects/${HASH6}/home" \
@@ -445,7 +445,7 @@ cd "${AIBOX_MIG_ROOT:-/v}"
 mkdir -p shared/claude-cfg projects
 if [ -d .claude ]; then
   for f in .claude/* .claude/.[!.]*; do
-    [ -e "$f" ] || continue
+    [ -e "$f" ] || [ -L "$f" ] || continue
     case "$(basename "$f")" in projects) continue ;; esac
     mv "$f" shared/claude-cfg/
   done
@@ -453,34 +453,64 @@ fi
 if [ -d .local/bin ] && [ ! -e shared/local-bin ]; then mv .local/bin shared/local-bin; fi
 if [ -d .local/share/claude ] && [ ! -e shared/claude-app ]; then mv .local/share/claude shared/claude-app; fi
 mkdir -p shared/local-bin shared/claude-app
+# copy_home <hash6>: seed a project home from the old root dotfiles.
+# Copies are staged then renamed, so a crash mid-copy leaves only a temp
+# dir that the re-run redoes — never a half .ssh that looks complete.
+copy_home() {
+  mkdir -p "projects/$1/home" "projects/$1/claude-projects"
+  for d in .ssh .config .gitconfig .zshrc .zsh_history .zshenv .zprofile .netrc; do
+    [ -e "$d" ] || continue
+    [ -e "projects/$1/home/$d" ] && continue
+    rm -rf "projects/$1/home/.aibox-mig-tmp"
+    cp -a "$d" "projects/$1/home/.aibox-mig-tmp"
+    mv "projects/$1/home/.aibox-mig-tmp" "projects/$1/home/$d"
+  done
+}
 CJ=shared/claude-cfg/.claude.json
 if [ -f "$CJ" ]; then
-  grep -o "\"/[^\"]*\"" "$CJ" | tr -d "\"" | sort -u | while read -r p; do
-    enc="$(printf %s "$p" | sed "s/[^A-Za-z0-9]/-/g")"
-    [ -d ".claude/projects/$enc" ] || continue
+  # Project paths appear as JSON KEYS ("/abs/path": ...). Value-position
+  # path strings (MCP args, history entries) must never claim a transcript
+  # dir — a stray match would strand sessions in a slice nothing mounts.
+  grep -o "\"/[^\"]*\":" "$CJ" | sed "s/\":\$//; s/^\"//" | sort -u | while read -r p; do
     h="$(printf %s "$p" | sha256sum | cut -c1-6)"
-    mkdir -p "projects/$h/claude-projects" "projects/$h/home"
-    [ -e "projects/$h/claude-projects/$enc" ] || mv ".claude/projects/$enc" "projects/$h/claude-projects/$enc"
-    for d in .ssh .config .gitconfig .zshrc .zsh_history .zshenv .zprofile .netrc; do
-      if [ -e "$d" ] && [ ! -e "projects/$h/home/$d" ]; then cp -a "$d" "projects/$h/home/$d"; fi
-    done
+    copy_home "$h"
+    enc="$(printf %s "$p" | sed "s/[^A-Za-z0-9]/-/g")"
+    if [ -d ".claude/projects/$enc" ] && [ ! -e "projects/$h/claude-projects/$enc" ]; then
+      mv ".claude/projects/$enc" "projects/$h/claude-projects/$enc"
+    fi
   done
 fi
-mkdir -p "projects/$1/home" "projects/$1/claude-projects"
+copy_home "$1"
+# Anything path-matching could not claim stays put (non-ASCII or >200-char
+# encodings, dirs with no .claude.json key) — but say so loudly.
+if [ -d .claude/projects ] && [ -n "$(ls -A .claude/projects 2>/dev/null)" ]; then
+  echo "aibox migrate: transcript dirs left unclaimed (kept in the volume at .claude/projects/):" >&2
+  ls .claude/projects >&2
+fi
 chown -R 1000:1000 shared projects 2>/dev/null || true
 echo 2 > .aibox-layout
 '
 
 _migrate_layout() {
+  # Anything with the volume mounted (labels or not — the oldest containers
+  # carry none) would race the file moves under a live claude.
   local running
-  running="$(docker ps -q --filter label=aibox.slug | head -1)"
-  [[ -n "$running" ]] && _die "The home volume needs a one-time migration to the per-project layout, but aibox sessions are running. Exit them, run: aibox stop --all, then retry."
-  # Serialize concurrent invocations (same mkdir-lock pattern as containers).
+  running="$(docker ps -q --filter "volume=${VOLUME}" | head -1)"
+  [[ -n "$running" ]] && _die "The home volume needs a one-time migration to the per-project layout, but containers are still using it. Exit sessions, run: aibox stop --all, then retry."
+  # Serialize concurrent invocations. The steal threshold must exceed the
+  # safety backup of a large volume (minutes), so it is deliberately huge;
+  # a genuinely stale lock (Ctrl-C at the wrong moment) gets a hint instead.
   local lock="${CONFIG_DIR}/.lock-migrate" waited=0
   until mkdir "$lock" 2>/dev/null; do
-    (( waited++ >= 300 )) && { rmdir "$lock" 2>/dev/null || true; waited=0; }
+    (( waited % 600 == 599 )) && _info "Waiting for another aibox migration to finish... (if none is running, remove the stale lock: rmdir ${lock})"
+    (( waited++ >= 36000 )) && { rmdir "$lock" 2>/dev/null || true; waited=0; }   # 1h
     sleep 0.1
   done
+  # Another invocation may have finished the migration while we waited.
+  if [[ "$(docker run --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '[ -f /v/.aibox-layout ] && echo done || true')" == "done" ]]; then
+    rmdir "$lock" 2>/dev/null || true
+    return 0
+  fi
   _info "Migrating ${VOLUME} to the per-project layout (one-time; old files stay in the volume untouched)..."
   local safety
   safety="$(_do_backup "$BACKUP_DIR" "aibox-home-pre-migrate")" \
@@ -503,18 +533,42 @@ _ensure_layout() {
   if [[ "$maj" =~ ^[0-9]+$ ]] && (( maj < 26 )); then
     _die "aibox needs Docker Engine 26+ (volume subpath mounts); found ${ver}. Update your runtime (brew upgrade colima / update OrbStack or Docker Desktop)."
   fi
+  # Fresh means EMPTY: any other marker-less content (even just an .ssh dir
+  # from an odd v1 life) goes through migration, which backs up first and
+  # only moves what it recognizes. Detection failing (offline first pull,
+  # daemon hiccup) must fail closed — creating containers against wrong
+  # slices produces far worse errors than stopping here.
   local state
   state="$(docker run --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '
     if [ -f /v/.aibox-layout ]; then echo current
-    elif [ -e /v/.claude ] || [ -e /v/.local ]; then echo legacy
-    else
+    elif [ -z "$(ls -A /v 2>/dev/null)" ]; then
       mkdir -p /v/shared/claude-cfg /v/shared/local-bin /v/shared/claude-app /v/projects
       echo 2 > /v/.aibox-layout
       echo current
-    fi' 2>/dev/null | tail -1)"
-  [[ "$state" == "legacy" ]] && _migrate_layout
-  docker run --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c \
-    "mkdir -p /v/projects/${HASH6}/home /v/projects/${HASH6}/claude-projects && chown -R 1000:1000 /v/projects/${HASH6}" >/dev/null 2>&1 || true
+    else echo legacy
+    fi' | tail -1)"
+  case "$state" in
+    current) ;;
+    legacy)  _migrate_layout ;;
+    *)       _die "Could not inspect the ${VOLUME} volume layout (docker error above). Retry once docker/network is healthy." ;;
+  esac
+  # This project's slices. The .aibox-path sentinel catches the (rare)
+  # 6-hex-digit path-hash collision between two projects, which would
+  # otherwise silently merge their private homes.
+  local slice
+  slice="$(docker run --rm -e "P=${PROJECT_DIR}" -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '
+    d="/v/projects/'"${HASH6}"'"
+    mkdir -p "$d/home" "$d/claude-projects"
+    if [ -f "$d/.aibox-path" ]; then
+      [ "$(cat "$d/.aibox-path")" = "$P" ] || { echo COLLISION; exit 0; }
+    else printf %s "$P" > "$d/.aibox-path"; fi
+    chown -R 1000:1000 "$d"
+    echo OK' | tail -1)"
+  case "$slice" in
+    OK) ;;
+    COLLISION) _die "Path-hash collision: another project already owns slice projects/${HASH6}. Rename this project directory to resolve it." ;;
+    *)  _die "Could not prepare the volume slices for ${SLUG} (docker error above)." ;;
+  esac
 }
 
 _ensure_container() {
@@ -536,10 +590,12 @@ _ensure_container() {
     --format '{{.State.Status}} {{.Config.Image}} {{index .Config.Labels "aibox.layout"}}' 2>/dev/null) || true
   state="${state:-absent}"
 
-  # Recreate when the image changed (new aibox version or node_version) or
-  # the container predates the current volume layout (its mounts are stale).
+  # Recreate when the image changed (new aibox version or node_version), the
+  # container predates the current volume layout (its mounts are stale), or
+  # it never got past Created (a failed docker run leaves the name wedged —
+  # docker start can never succeed, and there are no processes to protect).
   # The home volume and project bind survive by construction.
-  if [[ "$state" != "absent" && -n "${cur_img:-}" && ( "$cur_img" != "$IMAGE" || "${cur_layout:-}" != "2" ) ]]; then
+  if [[ "$state" != "absent" && -n "${cur_img:-}" && ( "$cur_img" != "$IMAGE" || "${cur_layout:-}" != "2" || "$state" == "created" ) ]]; then
     local active=0
     if [[ "$state" == "running" ]]; then
       active="$(docker top "$CONTAINER" -o pid,args 2>/dev/null | tail -n +2 | grep -vc 'sleep infinity' || true)"
@@ -725,8 +781,11 @@ cmd_serve() {
   if [[ "${1:-}" == "stop" ]]; then
     _ensure_docker
     if [[ "$(_state "$CONTAINER")" == "running" ]]; then
-      docker exec -u aibox "$CONTAINER" sh -c \
-        'pkill -f aibox-serve-ui; pkill -f -- "--remote-control"; true' >/dev/null 2>&1 || true
+      # Each pkill as direct exec argv: a sh -c wrapper would carry the
+      # pattern in its own cmdline and be pkill's first victim, aborting
+      # the rest. pkill always excludes itself.
+      docker exec -u aibox "$CONTAINER" pkill -f aibox-serve-ui >/dev/null 2>&1 || true
+      docker exec -u aibox "$CONTAINER" pkill -f -- --remote-control >/dev/null 2>&1 || true
       _ok "Stopped the sessions UI and all remote-control sessions for ${SLUG}."
     else
       _info "Not running: ${SLUG}"
@@ -746,7 +805,8 @@ const http = require("http"), fs = require("fs"), path = require("path"), cp = r
 const PORT = 45789;
 const HOME = process.env.HOME || "/home/aibox";
 const DIR = path.join(HOME, ".claude", "projects", process.cwd().replace(/[^A-Za-z0-9]/g, "-"));
-const PROJECT = path.basename(process.cwd());
+const esc = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const PROJECT = esc(path.basename(process.cwd()));
 
 function firstUserText(file) {
   try {
@@ -756,18 +816,31 @@ function firstUserText(file) {
     for (const line of buf.slice(0, n).toString("utf8").split("\n")) {
       if (!line.trim()) continue;
       let j; try { j = JSON.parse(line); } catch (e) { continue; }
-      if (j.type === "user" && j.message) {
+      if (j.type === "user" && j.message && !j.isMeta) {
         const c = j.message.content;
         let t = typeof c === "string" ? c : Array.isArray(c) ? c.map(x => x.text || "").join(" ") : "";
         t = t.replace(/\s+/g, " ").trim();
-        if (t) return t.slice(0, 90);
+        if (!t || t.startsWith("Caveat:") || t.startsWith("<command-")) continue;
+        return t.slice(0, 90);
       }
     }
   } catch (e) {}
   return "Untitled session";
 }
-function messageCount(file) {
-  try { return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).length; } catch (e) { return 0; }
+// Conversation turns only (transcripts also carry tool results and other
+// bookkeeping lines); cached by size+mtime — transcripts can be many MB and
+// this runs on every poll.
+const countCache = {};
+function messageCount(file, st) {
+  const c = countCache[file];
+  if (c && c.size === st.size && c.mtimeMs === st.mtimeMs) return c.n;
+  let n = 0;
+  try {
+    for (const l of fs.readFileSync(file, "utf8").split("\n"))
+      if (l.includes("\"type\":\"user\"") || l.includes("\"type\":\"assistant\"")) n++;
+  } catch (e) { return 0; }
+  countCache[file] = { size: st.size, mtimeMs: st.mtimeMs, n: n };
+  return n;
 }
 function liveIds(cb) {
   cp.exec("pgrep -fa -- --remote-control || true", (e, out) => {
@@ -783,10 +856,16 @@ function sessions(cb) {
   let files = [];
   try { files = fs.readdirSync(DIR).filter(f => f.endsWith(".jsonl")); } catch (e) {}
   liveIds(live => {
-    const list = files.map(f => {
-      const p = path.join(DIR, f), st = fs.statSync(p), id = f.slice(0, -6);
-      return { id, mtime: st.mtimeMs, title: firstUserText(p), messages: messageCount(p), live: live.has(id) };
-    }).sort((a, b) => b.mtime - a.mtime);
+    const list = [];
+    files.forEach(f => {
+      // Per-file guard: a transcript can vanish between readdir and stat
+      // (Claude Code cleanup, manual rm) — that must not kill the server.
+      try {
+        const p = path.join(DIR, f), st = fs.statSync(p), id = f.slice(0, -6);
+        list.push({ id, mtime: st.mtimeMs, title: firstUserText(p), messages: messageCount(p, st), live: live.has(id) });
+      } catch (e) {}
+    });
+    list.sort((a, b) => b.mtime - a.mtime);
     // Live processes whose transcript has not appeared yet (a session
     // spawned moments ago) still deserve a row.
     const known = new Set(list.map(s => s.id));
@@ -876,12 +955,20 @@ document.getElementById("new").onclick=()=>{
 };
 load();setInterval(load,15000);
 </script></body></html>`;
+function spawnSession(args) {
+  const c = cp.spawn("script", ["-qfc", "claude " + args + " --remote-control", "/dev/null"],
+    { detached: true, stdio: "ignore", cwd: process.cwd() });
+  c.on("error", function () {});
+  c.unref();
+}
 http.createServer((req, res) => {
-  const u = new URL(req.url, "http://x");
+  let u;
+  // Request-targets like "//" make new URL() throw — a crash here would
+  // kill the whole UI.
+  try { u = new URL(req.url, "http://x"); } catch (e) { res.writeHead(400); return res.end("bad request"); }
   if (req.method === "POST" && u.pathname === "/api/new") {
     const id = require("crypto").randomUUID();
-    cp.spawn("script", ["-qfc", "claude --session-id " + id + " --remote-control", "/dev/null"],
-      { detached: true, stdio: "ignore", cwd: process.cwd() }).unref();
+    spawnSession("--session-id " + id);
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify({ ok: true, id: id }));
   }
@@ -898,10 +985,14 @@ http.createServer((req, res) => {
   if (req.method === "POST" && u.pathname === "/api/resume") {
     const id = String(u.searchParams.get("id") || "");
     if (!/^[0-9a-f-]{36}$/.test(id)) { res.writeHead(400); return res.end("bad id"); }
-    cp.spawn("script", ["-qfc", "claude --resume " + id + " --remote-control", "/dev/null"],
-      { detached: true, stdio: "ignore", cwd: process.cwd() }).unref();
-    res.writeHead(200, { "content-type": "application/json" });
-    return res.end("{\"ok\":true}");
+    return liveIds(live => {
+      // Double-resume would attach two claude processes to one transcript
+      // (clients on several devices share this page).
+      if (live.has(id)) { res.writeHead(409); return res.end("already live"); }
+      spawnSession("--resume " + id);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{\"ok\":true}");
+    });
   }
   if (u.pathname === "/api/sessions") {
     return sessions(list => {
@@ -911,12 +1002,16 @@ http.createServer((req, res) => {
   }
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(PAGE);
+  // Container-wide bind is what lets the dev proxy reach us; the accepted
+  // trade-off is that other containers on the aibox network can reach it
+  // too. Endpoints only spawn/stop sessions of THIS project.
 }).listen(PORT, "0.0.0.0");
 UIJS
   if ! docker exec -u aibox "$CONTAINER" pgrep -f aibox-serve-ui >/dev/null 2>&1; then
-    docker exec -d -u aibox -w "$PROJECT_DIR" "$CONTAINER" bash -c '
-      # aibox-serve-ui
-      exec node "$HOME/.aibox-serve/ui.js" >>"$HOME/.aibox-serve/ui.log" 2>&1'
+    # The tag rides as an (ignored) node argv so it survives exec and is
+    # visible to pgrep/pkill — a comment in bash -c would be erased by exec.
+    docker exec -d -u aibox -w "$PROJECT_DIR" "$CONTAINER" bash -c \
+      'exec node "$HOME/.aibox-serve/ui.js" aibox-serve-ui >>"$HOME/.aibox-serve/ui.log" 2>&1'
   fi
 
   _ok "Sessions UI: $(_dev_url 45789) — new session, resume, live list."
@@ -985,7 +1080,7 @@ cmd_status() {
   fi
   # Daemon-wide disk picture (images/containers/volumes + reclaimable).
   local df
-  df="$(docker system df --format '{{.Type}} {{.Size}} ({{.Reclaimable}} reclaimable)' 2>/dev/null \
+  df="$(docker system df --format '{{.Type}}: {{.Size}}, reclaimable {{.Reclaimable}}' 2>/dev/null \
     | sed 's/^Local Volumes/Volumes/; s/^Build Cache/Build-cache/' | tr '\n' '\t')" || true
   [[ -n "$df" ]] && { echo ""; echo "Docker disk:  $(echo "$df" | sed 's/\t$//; s/\t/  ·  /g')"; }
   echo ""
@@ -1027,6 +1122,8 @@ _do_backup() {
 
 cmd_backup() {
   _ensure_docker
+  [[ -d "${CONFIG_DIR}/.lock-migrate" ]] \
+    && _die "A volume-layout migration is in progress — retry once it finishes."
   docker volume inspect "$VOLUME" >/dev/null 2>&1 \
     || _die "No ${VOLUME} volume yet — nothing to back up."
   local out
@@ -1042,6 +1139,8 @@ cmd_restore() {
   file="$(cd "$(dirname "$file")" && pwd)/$(basename "$file")"
   [[ "$file" == *:* ]] && _die "Backup path contains ':' — docker cannot mount it. Move/rename the file first."
   _ensure_docker
+  [[ -d "${CONFIG_DIR}/.lock-migrate" ]] \
+    && _die "A volume-layout migration is in progress — retry once it finishes."
   docker volume create "$VOLUME" >/dev/null 2>&1 || true
 
   # Validate the archive BEFORE touching anything. The file is mounted at a
