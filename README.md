@@ -88,7 +88,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 | `aibox serve [args]` | Keep a `claude remote-control` server + sessions UI running in the container — drive sessions from your phone/claude.ai, revive past sessions with a click. `aibox serve stop` ends it |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
 | `aibox stop [--all]` | Stop this project's container (`--all`: everything incl. proxy). Loses nothing |
-| `aibox status` | Containers, dev URLs, home volume size |
+| `aibox status` | Containers with live memory + disk use, dev URLs, Docker disk totals, home volume size |
 | `aibox backup [dir]` | Snapshot the home volume to a tar.gz |
 | `aibox restore <file>` | Restore a backup (safety-backup of current state first) |
 | `aibox update` | Update the CLI; image rebuilds automatically on next run |

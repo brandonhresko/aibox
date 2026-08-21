@@ -37,7 +37,9 @@
 #   aibox stop [--all]        Stop this project's container
 #                             (--all: every aibox container + proxy).
 #                             Never deletes anything; next run re-attaches.
-#   aibox status              Containers, dev-server URLs, home volume size
+#   aibox status              Containers with live memory + disk use,
+#                             dev-server URLs, Docker disk totals, home
+#                             volume size
 #   aibox backup [dir]        Snapshot the aibox-home volume to a tar.gz
 #                             (default dir: ~/aibox-backups)
 #   aibox restore <file>      Restore a backup into aibox-home
@@ -953,20 +955,37 @@ cmd_status() {
   if [[ -z "$rows" ]]; then
     echo "No aibox containers. Run aibox in a project directory to start one."
   else
+    # One stats sample for all running containers (docker stats needs ~2s)
+    # and rw-layer sizes for all; joined per row below by container name.
+    local running_names stats sizes
+    running_names="$(docker ps --filter label=aibox.slug --format '{{.Names}}' | tr '\n' ' ')"
+    stats=""
+    if [[ -n "${running_names// /}" ]]; then
+      # shellcheck disable=SC2086
+      stats="$(docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' $running_names 2>/dev/null || true)"
+    fi
+    sizes="$(docker ps -as --filter label=aibox.slug --format '{{.Names}} {{.Size}}' 2>/dev/null || true)"
     local suffix key name
     suffix="$(_proxy_suffix)"
-    printf "%-18s %-22s %-30s %s\n" "PROJECT" "STATUS" "DEV URL" "PATH"
+    printf "%-18s %-20s %-10s %-10s %-30s %s\n" "PROJECT" "STATUS" "MEM" "DISK" "DEV URL" "PATH"
     while IFS=$'\t' read -r cslug cstatus cimage cpath cname; do
-      local url="-"
+      local url="-" mem disk
       while read -r key name; do
         [[ "$name" == "$cname" ]] && url="<port>.${key}.aibox.localhost${suffix}"
       done < <(_proxy_pairs)
+      mem="$(awk -v n="$cname" '$1==n{print $2}' <<< "$stats")"
+      disk="$(awk -v n="$cname" '$1==n{print $2}' <<< "$sizes")"
       # De-jargon docker's status ("Up 2 hours", "Exited (143) 3 days ago")
       cstatus="$(echo "$cstatus" | sed 's/^Up /running /; s/^Exited ([0-9]*) /stopped /; s/^Created$/created/')"
-      printf "%-18s %-22s %-30s %s\n" "$cslug" "$cstatus" "$url" "$cpath"
+      printf "%-18s %-20s %-10s %-10s %-30s %s\n" "$cslug" "$cstatus" "${mem:--}" "${disk:--}" "$url" "$cpath"
       [[ "$cimage" != "$IMAGE" ]] && _info "  ${cslug}: image ${cimage} (current: ${IMAGE} — recreated on next run)"
     done <<< "$rows"
   fi
+  # Daemon-wide disk picture (images/containers/volumes + reclaimable).
+  local df
+  df="$(docker system df --format '{{.Type}} {{.Size}} ({{.Reclaimable}} reclaimable)' 2>/dev/null \
+    | sed 's/^Local Volumes/Volumes/; s/^Build Cache/Build-cache/' | tr '\n' '\t')" || true
+  [[ -n "$df" ]] && { echo ""; echo "Docker disk:  $(echo "$df" | sed 's/\t$//; s/\t/  ·  /g')"; }
   echo ""
   local pstate
   pstate="$(_state "$PROXY")"
