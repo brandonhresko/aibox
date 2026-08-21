@@ -77,6 +77,7 @@ These were decided explicitly; the rewrite must not relitigate them.
 aibox                      # same as `aibox claude`
 aibox claude [args...]     # shorthand for `aibox run claude`; --yolo skips all prompts, --copy uses a disposable snapshot container, other args pass through (--resume, -c, etc.)
 aibox run [--copy] <prog> [args...]  # ensure image/container/proxy, then run any program inside (e.g. aibox run codex)
+aibox serve [args...]      # detached claude remote-control server + sessions UI (port 45789) in the container; serve stop ends it
 aibox shell [cmd...]       # zsh in the container, or run a one-off command
 aibox stop [--all]         # stop this project's container (--all: every aibox container + proxy). Never deletes anything
 aibox status               # all aibox containers: project, state, uptime, image; proxy URLs; volume size
