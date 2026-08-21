@@ -54,9 +54,12 @@
 # Dockerfile (survives image rebuilds; plain apt installs survive stop/start
 # but reset when the image changes).
 #
-# All Claude state (sessions, login, the claude binary itself) lives in one
-# shared Docker volume: aibox-home. Containers are disposable; the volume is
-# the thing `aibox backup` protects.
+# All Claude state lives in one Docker volume (aibox-home), sliced per
+# project: login, settings, and the claude binary are shared; each project
+# gets a private home (ssh keys, shell history, its own sessions) that other
+# projects' containers never mount. Needs Docker Engine 26+. Volumes from
+# older aibox versions are migrated automatically (safety backup first).
+# Containers are disposable; the volume is what `aibox backup` protects.
 #
 # (This header is the output of `aibox help` — keep it accurate.)
 
@@ -204,6 +207,27 @@ chown -R aibox:aibox /home/aibox 2>/dev/null || true
 if [[ ! -e /home/aibox/.zshrc ]]; then
   printf 'autoload -Uz compinit && compinit\nPROMPT="%%F{cyan}%%1~%%f %%# "\n' > /home/aibox/.zshrc
   chown aibox:aibox /home/aibox/.zshrc
+fi
+# Claude Code deletes transcripts idle >30 days by default; raise that once
+# so session history is permanent. Never touches an existing value, skips
+# an unparseable file.
+node -e '
+const fs=require("fs"),p="/home/aibox/.claude/settings.json";
+let s={};
+if(fs.existsSync(p)){try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch(e){process.exit(0)}}
+if(s.cleanupPeriodDays==null){s.cleanupPeriodDays=3650;fs.writeFileSync(p,JSON.stringify(s,null,2));}
+' 2>/dev/null || true
+chown aibox:aibox /home/aibox/.claude/settings.json 2>/dev/null || true
+# Teach every session how to find and revive this project's past sessions.
+CM=/home/aibox/.claude/CLAUDE.md
+if ! grep -q 'aibox:sessions' "$CM" 2>/dev/null; then
+  cat >> "$CM" <<'NOTES'
+
+<!-- aibox:sessions -->
+- Past Claude sessions of this project are JSONL files under `~/.claude/projects/*/` — grep them to find one; the filename (minus .jsonl) is the session id.
+- To make a past session controllable from claude.ai / the Claude phone app: `nohup script -qfc "claude --resume <session-id> --remote-control" /dev/null >/dev/null 2>&1 &` — it appears in the claude.ai session list within seconds.
+NOTES
+  chown aibox:aibox "$CM" 2>/dev/null || true
 fi
 # First start with an empty home volume: install Claude Code into the volume
 # so the binary and its self-updates persist across container recreation.
@@ -353,15 +377,28 @@ _ensure_net_vol() {
 # Shared run-spec for project containers. Per-mode flags (restart policy,
 # bind mount, labels) come as args and land before "$IMAGE" — docker flag
 # order before the image is irrelevant.
+#
+# The home volume is mounted in slices (volume-subpath, Engine 26+): a
+# private per-project home, with the shared Claude login/settings, binary,
+# and this project's own transcripts mounted over it at their normal paths.
+# Other projects' homes and transcripts are simply not mounted — that is the
+# isolation boundary (in-volume permissions are meaningless with full sudo).
+# todos/file-history/shell-snapshots stay inside the shared .claude mount.
 _docker_run() {
   docker run -d --name "$CONTAINER" \
     --network "$NETWORK" \
+    --hostname "$SLUG" \
     --init \
     --add-host host.docker.internal:host-gateway \
-    -v "${VOLUME}:/home/aibox" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox,volume-subpath=projects/${HASH6}/home" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.claude,volume-subpath=shared/claude-cfg" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.claude/projects,volume-subpath=projects/${HASH6}/claude-projects" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/bin,volume-subpath=shared/local-bin" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/share/claude,volume-subpath=shared/claude-app" \
     -w "$PROJECT_DIR" \
     -e CLAUDE_CONFIG_DIR=/home/aibox/.claude \
     -l "aibox.path=${PROJECT_DIR}" \
+    -l "aibox.layout=2" \
     "$@" "$IMAGE"
 }
 
@@ -373,6 +410,99 @@ _wait_running() {
     docker start "$CONTAINER" >/dev/null 2>&1 || true
     sleep 0.2
   done
+}
+
+# ── Volume layout (v2: per-project isolation) ────────────────────
+# aibox-home layout: shared/{claude-cfg,local-bin,claude-app} for the Claude
+# login/settings and binary, projects/<hash6>/{home,claude-projects} per
+# project. Marker file .aibox-layout at the volume root says the shape is
+# current; a volume with old flat data and no marker is migrated in place
+# (safety backup first). Unrecognized files are never moved or deleted.
+
+# The migration body, shared verbatim between the docker run below and the
+# test harness (which runs it against a plain directory via AIBOX_MIG_ROOT).
+# POSIX sh — it runs under busybox in the helper image. $1 = hash6 of the
+# project being started, so its slice exists even if it's new.
+# Everything is driven by the absolute-path keys in .claude.json: the
+# transcript dir names are lossy encodings (all punctuation → "-"), so the
+# real paths are the only way to compute each project's hash.
+_MIGRATE_SH='
+set -e
+cd "${AIBOX_MIG_ROOT:-/v}"
+[ -f .aibox-layout ] && exit 0
+mkdir -p shared/claude-cfg projects
+if [ -d .claude ]; then
+  for f in .claude/* .claude/.[!.]*; do
+    [ -e "$f" ] || continue
+    case "$(basename "$f")" in projects) continue ;; esac
+    mv "$f" shared/claude-cfg/
+  done
+fi
+if [ -d .local/bin ] && [ ! -e shared/local-bin ]; then mv .local/bin shared/local-bin; fi
+if [ -d .local/share/claude ] && [ ! -e shared/claude-app ]; then mv .local/share/claude shared/claude-app; fi
+mkdir -p shared/local-bin shared/claude-app
+CJ=shared/claude-cfg/.claude.json
+if [ -f "$CJ" ]; then
+  grep -o "\"/[^\"]*\"" "$CJ" | tr -d "\"" | sort -u | while read -r p; do
+    enc="$(printf %s "$p" | sed "s/[^A-Za-z0-9]/-/g")"
+    [ -d ".claude/projects/$enc" ] || continue
+    h="$(printf %s "$p" | sha256sum | cut -c1-6)"
+    mkdir -p "projects/$h/claude-projects" "projects/$h/home"
+    [ -e "projects/$h/claude-projects/$enc" ] || mv ".claude/projects/$enc" "projects/$h/claude-projects/$enc"
+    for d in .ssh .config .gitconfig .zshrc .zsh_history .zshenv .zprofile .netrc; do
+      if [ -e "$d" ] && [ ! -e "projects/$h/home/$d" ]; then cp -a "$d" "projects/$h/home/$d"; fi
+    done
+  done
+fi
+mkdir -p "projects/$1/home" "projects/$1/claude-projects"
+chown -R 1000:1000 shared projects 2>/dev/null || true
+echo 2 > .aibox-layout
+'
+
+_migrate_layout() {
+  local running
+  running="$(docker ps -q --filter label=aibox.slug | head -1)"
+  [[ -n "$running" ]] && _die "The home volume needs a one-time migration to the per-project layout, but aibox sessions are running. Exit them, run: aibox stop --all, then retry."
+  # Serialize concurrent invocations (same mkdir-lock pattern as containers).
+  local lock="${CONFIG_DIR}/.lock-migrate" waited=0
+  until mkdir "$lock" 2>/dev/null; do
+    (( waited++ >= 300 )) && { rmdir "$lock" 2>/dev/null || true; waited=0; }
+    sleep 0.1
+  done
+  _info "Migrating ${VOLUME} to the per-project layout (one-time; old files stay in the volume untouched)..."
+  local safety
+  safety="$(_do_backup "$BACKUP_DIR" "aibox-home-pre-migrate")" \
+    || { rmdir "$lock" 2>/dev/null || true; _die "Safety backup failed — migration aborted, the volume is untouched."; }
+  _ok "Safety backup: ${safety}"
+  if ! printf '%s' "$_MIGRATE_SH" | docker run -i --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -s "$HASH6"; then
+    rmdir "$lock" 2>/dev/null || true
+    _die "Migration failed — restore the safety backup above with: aibox restore <file>"
+  fi
+  rmdir "$lock" 2>/dev/null || true
+  _ok "Migrated. Each project now has a private home; login, settings, and the claude binary stay shared."
+}
+
+# Detect the volume's shape, create/migrate as needed, and make sure this
+# project's slices exist. Called right before every container create.
+_ensure_layout() {
+  local ver maj
+  ver="$(docker version --format '{{.Server.Version}}' 2>/dev/null)"
+  maj="${ver%%.*}"
+  if [[ "$maj" =~ ^[0-9]+$ ]] && (( maj < 26 )); then
+    _die "aibox needs Docker Engine 26+ (volume subpath mounts); found ${ver}. Update your runtime (brew upgrade colima / update OrbStack or Docker Desktop)."
+  fi
+  local state
+  state="$(docker run --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '
+    if [ -f /v/.aibox-layout ]; then echo current
+    elif [ -e /v/.claude ] || [ -e /v/.local ]; then echo legacy
+    else
+      mkdir -p /v/shared/claude-cfg /v/shared/local-bin /v/shared/claude-app /v/projects
+      echo 2 > /v/.aibox-layout
+      echo current
+    fi' 2>/dev/null | tail -1)"
+  [[ "$state" == "legacy" ]] && _migrate_layout
+  docker run --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c \
+    "mkdir -p /v/projects/${HASH6}/home /v/projects/${HASH6}/claude-projects && chown -R 1000:1000 /v/projects/${HASH6}" >/dev/null 2>&1 || true
 }
 
 _ensure_container() {
@@ -389,23 +519,24 @@ _ensure_container() {
   done
   trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 
-  local state cur_img
-  read -r state cur_img < <(docker inspect "$CONTAINER" \
-    --format '{{.State.Status}} {{.Config.Image}}' 2>/dev/null) || true
+  local state cur_img cur_layout
+  read -r state cur_img cur_layout < <(docker inspect "$CONTAINER" \
+    --format '{{.State.Status}} {{.Config.Image}} {{index .Config.Labels "aibox.layout"}}' 2>/dev/null) || true
   state="${state:-absent}"
 
-  # Recreate only when the image changed (new aibox version or node_version).
+  # Recreate when the image changed (new aibox version or node_version) or
+  # the container predates the current volume layout (its mounts are stale).
   # The home volume and project bind survive by construction.
-  if [[ "$state" != "absent" && -n "${cur_img:-}" && "$cur_img" != "$IMAGE" ]]; then
+  if [[ "$state" != "absent" && -n "${cur_img:-}" && ( "$cur_img" != "$IMAGE" || "${cur_layout:-}" != "2" ) ]]; then
     local active=0
     if [[ "$state" == "running" ]]; then
       active="$(docker top "$CONTAINER" -o pid,args 2>/dev/null | tail -n +2 | grep -vc 'sleep infinity' || true)"
       active="${active//[^0-9]/}"   # arithmetic-safe
     fi
     if [[ "${active:-0}" -gt 0 ]]; then
-      _warn "Image updated (${cur_img} → ${IMAGE}) but ${active} process(es) still running in the old container — keeping it for now. To update: exit sessions / stop dev servers, then run: aibox stop && aibox"
+      _warn "Container needs recreating (image or layout updated) but ${active} process(es) still running in the old one — keeping it for now. To update: exit sessions / stop dev servers, then run: aibox stop && aibox"
     else
-      _info "Image changed (${cur_img} → ${IMAGE}). Recreating container — sessions/login/project files persist; apt-installed packages reset (use ~/.aibox/Dockerfile.extra to keep them)."
+      _info "Recreating container (image or layout updated) — sessions/login/project files persist; apt-installed packages reset (use ~/.aibox/Dockerfile.extra to keep them)."
       docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
       state=absent
     fi
@@ -413,6 +544,7 @@ _ensure_container() {
 
   if [[ "$state" == "absent" ]]; then
     _require_safe_dir
+    _ensure_layout
     local run_err=""
     # 2>&1 >/dev/null captures stderr only (order matters) — shown by
     # _wait_running if the container never comes up.
@@ -499,6 +631,7 @@ _ensure_copy_all() {
   _ensure_image
   _require_safe_dir
   _ensure_net_vol
+  _ensure_layout
   # Unique name per run: concurrent --copy sessions are separate sandboxes.
   # The trailing random segment doubles as the URL suffix if slugs collide
   # (see _proxy_pairs). No --restart policy: disposable by design.
@@ -676,8 +809,9 @@ cmd_restore() {
 
   echo "This replaces the contents of ${VOLUME} (sessions, login, claude binary)"
   echo "with: ${file}"
-  echo "A safety backup is taken first; running aibox containers are stopped"
-  echo "and restarted around the restore."
+  echo "A safety backup is taken first. aibox containers are removed so the"
+  echo "next run recreates them against the restored data (project files are"
+  echo "untouched; apt-installed packages reset)."
   _confirm "Restore?" || { echo "Aborted — nothing was changed."; return 0; }
 
   local running
@@ -701,9 +835,14 @@ cmd_restore() {
     || _die "Restore failed mid-way. Recover with: aibox restore <the safety backup above>"
   _ok "Restored ${VOLUME} from $(basename "$file")."
 
-  if [[ -n "$running" ]]; then
-    echo "$running" | xargs docker start >/dev/null
-    _ok "Restarted: $(echo "$running" | tr '\n' ' ')"
+  # Containers must be recreated, not restarted: their volume-subpath mounts
+  # may not match the restored data (a pre-migration backup has none of the
+  # slices; the next aibox run re-runs layout detection/migration).
+  local stale
+  stale="$(docker ps -aq --filter label=aibox.slug)"
+  if [[ -n "$stale" ]]; then
+    echo "$stale" | xargs docker rm -f >/dev/null 2>&1 || true
+    _ok "Removed old containers — the next aibox run in each project recreates them."
   fi
 }
 

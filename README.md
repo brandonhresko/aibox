@@ -28,7 +28,7 @@ aibox                       # 3. run (builds the image on first use)
 
 - **One container per project directory.** `aibox` in a project creates (or re-attaches to) that project's container. Open more terminal tabs and run `aibox` again — they attach to the same container.
 - **Your project is bind-mounted at its real path.** Changes sync both ways, paths inside the container match your Mac.
-- **One shared home volume (`aibox-home`).** Claude login, every session, shell history, and the `claude` binary itself live in a Docker volume mounted at `/home/aibox` in every container. Log in once, resume any session from any project, forever.
+- **One home volume, sliced per project.** Claude login, settings, and the `claude` binary live in shared slices of the `aibox-home` volume — log in once, forever. Everything else in a project's home (ssh keys, shell history, caches, and that project's sessions) is a private slice only its own containers mount, so one project's agent can't read another project's files or history. Volumes from older aibox versions migrate to this layout automatically on first run, with a safety backup taken first.
 - **Nothing is destroyed implicitly.** Exiting Claude leaves the container running in the background (idle containers cost ~nothing) — the next `aibox` attaches instantly. `aibox stop` stops it; a stopped container keeps everything, including packages you apt-installed. Containers are only recreated when the image changes, and the home volume survives even that.
 - **The container is the sandbox.** Full sudo inside. Permission prompts are on by default, but bypass mode is always available in-session (aibox passes claude's `--allow-dangerously-skip-permissions`); run `aibox --yolo` to start with all prompts skipped (`--dangerously-skip-permissions`).
 - **Disposable copies on demand.** `aibox --copy` runs Claude in a fresh container on a *snapshot* of the project instead — nothing is bind-mounted, so the agent physically can't touch your real files. Same login and session history (shared home volume), own dev URLs (`<port>.<project>-copy.aibox.localhost`). The container is removed when the session exits; keep work by committing and pushing from inside. Each `--copy` run is its own independent sandbox. Combines with `--yolo`, and works for any program via `aibox run <prog> --copy`.
@@ -99,7 +99,7 @@ The image is `node:<version>-bookworm` (Debian) plus a few basics (zsh, sudo, ri
 
 ## Prerequisites
 
-Built for macOS; works on Linux too (any running Docker daemon). On macOS, Docker via [Colima](https://github.com/abiosoft/colima), [OrbStack](https://orbstack.dev), or [Docker Desktop](https://www.docker.com/products/docker-desktop/):
+Built for macOS; works on Linux too. Needs Docker Engine 26+ (any 2024-or-later runtime; aibox checks and tells you if not). On macOS, Docker via [Colima](https://github.com/abiosoft/colima), [OrbStack](https://orbstack.dev), or [Docker Desktop](https://www.docker.com/products/docker-desktop/):
 
 ```bash
 brew install colima docker && colima start
