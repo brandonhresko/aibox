@@ -22,15 +22,14 @@
 #                             (commit & push from inside to keep work).
 #                             A `--` ends aibox's own flag parsing, so a
 #                             literal --copy/--yolo can reach the program.
-#   aibox serve [args...]     Keep a claude remote-control server running in
-#                             the container — it survives closing the
-#                             terminal, and its sessions are driven from
-#                             claude.ai or the Claude phone app. Also serves
-#                             a sessions UI on port 45789 (dev-proxy URL) to
-#                             browse this project's past sessions and
-#                             revive one with a click. Extra args pass to
-#                             `claude remote-control` (--spawn, --capacity,
-#                             ...). `aibox serve stop` ends it.
+#   aibox serve               Run the sessions UI on port 45789 (dev-proxy
+#                             URL): start new phone/browser-drivable
+#                             sessions, resume past ones, see and stop live
+#                             ones. Each session is a detached claude
+#                             process in the container — it survives closing
+#                             the terminal and shows up at claude.ai / the
+#                             Claude app. `aibox serve stop` ends the UI and
+#                             every live session.
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
 #                             shell string (pipes/globs work); several run
 #                             as a safely-quoted command.
@@ -237,6 +236,7 @@ if ! grep -q 'aibox:sessions' "$CM" 2>/dev/null; then
 <!-- aibox:sessions -->
 - Past Claude sessions of this project are JSONL files under `~/.claude/projects/*/` — grep them to find one; the filename (minus .jsonl) is the session id.
 - To make a past session controllable from claude.ai / the Claude phone app: `nohup script -qfc "claude --resume <session-id> --remote-control" /dev/null >/dev/null 2>&1 &` — it appears in the claude.ai session list within seconds.
+- To start a brand-new session there instead: same command with `--session-id $(cat /proc/sys/kernel/random/uuid)` in place of `--resume <session-id>`.
 NOTES
   chown aibox:aibox "$CM" 2>/dev/null || true
 fi
@@ -713,54 +713,30 @@ cmd_shell() {
   fi
 }
 
-# ── Serve: phone/browser sessions (claude remote-control) ────────
-# Keeps a claude remote-control server running detached in the project
-# container — outbound HTTPS only, so no ports or proxy work — plus a small
-# sessions UI on port 45789 (reachable through the dev proxy). Both survive
-# closed terminals; sessions are driven from claude.ai / the Claude app.
-# The supervisor restarts the server if it exits (it gives up after ~10min
-# of network refusals) and stops after 3 quick failures in a row, which
-# means "not logged in / not eligible" — the log says so.
+# ── Serve: phone/browser sessions (remote control) ───────────────
+# One model: every live session — brand new or revived — is one detached
+# `claude ... --remote-control` process in the project container, spawned
+# from the sessions UI (port 45789, via the dev proxy) or by any Claude
+# session (the shared CLAUDE.md teaches the command). No server mode and no
+# resume windows: a dead process's conversation is just a transcript on
+# disk, and Resume is the recovery. Registration is outbound HTTPS only.
+# `aibox serve` runs the UI; `aibox serve stop` also kills every session.
 cmd_serve() {
   if [[ "${1:-}" == "stop" ]]; then
     _ensure_docker
     if [[ "$(_state "$CONTAINER")" == "running" ]]; then
-      # Supervisor first (or it would just restart what we kill next).
       docker exec -u aibox "$CONTAINER" sh -c \
-        'pkill -f aibox-serve-rc; pkill -f "claude remote-control"; pkill -f "aibox-serve-ui"; pkill -f -- "--resume.*--remote-control"; true' >/dev/null 2>&1 || true
-      _ok "Stopped the remote-control server, sessions UI, and revived sessions for ${SLUG}."
+        'pkill -f aibox-serve-ui; pkill -f -- "--remote-control"; true' >/dev/null 2>&1 || true
+      _ok "Stopped the sessions UI and all remote-control sessions for ${SLUG}."
     else
       _info "Not running: ${SLUG}"
     fi
     return 0
   fi
+  [[ $# -eq 0 ]] || _die "Usage: aibox serve [stop]"
 
   _ensure_all
   _ensure_claude_bin
-
-  if docker exec -u aibox "$CONTAINER" pgrep -f aibox-serve-rc >/dev/null 2>&1; then
-    _info "Serve already running for ${SLUG}."
-  else
-    # Extra args pass through to `claude remote-control` verbatim.
-    local rc_cmd="claude remote-control --remote-control-session-name-prefix aibox-${SLUG}"
-    [[ $# -gt 0 ]] && rc_cmd+="$(printf ' %q' "$@")"
-    # script(1) gives claude the pty it expects; the env var dodges quoting.
-    docker exec -d -u aibox -w "$PROJECT_DIR" -e "AIBOX_RC_CMD=${rc_cmd}" "$CONTAINER" bash -c '
-      # aibox-serve-rc
-      mkdir -p "$HOME/.aibox-serve"
-      exec >>"$HOME/.aibox-serve/rc.log" 2>&1
-      fails=0
-      while :; do
-        start=$(date +%s)
-        script -qfc "$AIBOX_RC_CMD" /dev/null
-        (( $(date +%s) - start < 60 )) && fails=$((fails+1)) || fails=0
-        if (( fails >= 3 )); then
-          echo "aibox-serve: giving up after 3 quick exits — likely not logged in or Remote Control unavailable. Fix, then rerun: aibox serve"
-          exit 1
-        fi
-        sleep 10
-      done'
-  fi
 
   # Sessions UI (idempotent: rewrite the file, start only if not running).
   docker exec -i -u aibox "$CONTAINER" sh -c 'mkdir -p "$HOME/.aibox-serve" && cat > "$HOME/.aibox-serve/ui.js"' <<'UIJS'
@@ -797,7 +773,7 @@ function liveIds(cb) {
   cp.exec("pgrep -fa -- --remote-control || true", (e, out) => {
     const ids = new Set();
     String(out || "").split("\n").forEach(l => {
-      const m = l.match(/--resume[= ]([0-9a-f-]{36})/);
+      const m = l.match(/(?:--resume|--session-id)[= ]([0-9a-f-]{36})/);
       if (m) ids.add(m[1]);
     });
     cb(ids);
@@ -807,10 +783,17 @@ function sessions(cb) {
   let files = [];
   try { files = fs.readdirSync(DIR).filter(f => f.endsWith(".jsonl")); } catch (e) {}
   liveIds(live => {
-    cb(files.map(f => {
+    const list = files.map(f => {
       const p = path.join(DIR, f), st = fs.statSync(p), id = f.slice(0, -6);
       return { id, mtime: st.mtimeMs, title: firstUserText(p), messages: messageCount(p), live: live.has(id) };
-    }).sort((a, b) => b.mtime - a.mtime));
+    }).sort((a, b) => b.mtime - a.mtime);
+    // Live processes whose transcript has not appeared yet (a session
+    // spawned moments ago) still deserve a row.
+    const known = new Set(list.map(s => s.id));
+    live.forEach(id => {
+      if (!known.has(id)) list.unshift({ id, mtime: Date.now(), title: "New session — say something to it", messages: 0, live: true });
+    });
+    cb(list);
   });
 }
 const PAGE = `<!doctype html><html><head><meta charset="utf-8">
@@ -840,10 +823,16 @@ a.open{color:var(--accent-ink);background:var(--accent)}
 button.res{color:var(--accent);background:var(--accent-soft)}
 button.res:hover{background:var(--accent);color:var(--accent-ink)}
 button.res[disabled]{opacity:.6;cursor:wait}
+.hrow{display:flex;align-items:center;justify-content:space-between;gap:16px}
+button.newb{font-family:inherit;font-size:13.5px;font-weight:600;border:none;border-radius:999px;padding:8px 18px;background:var(--accent);color:var(--accent-ink);cursor:pointer}
+button.newb[disabled]{opacity:.6;cursor:wait}
+button.stopb{font-family:inherit;font-size:13px;font-weight:600;border:none;background:none;color:var(--muted);cursor:pointer;padding:7px 6px}
+button.stopb:hover{color:var(--ink)}
 .empty{padding:36px 22px;color:var(--muted);text-align:center}
 .hint{margin:18px 6px 0;font-size:13px;color:var(--muted)}
 </style></head><body><div class="wrap">
-<p class="eyebrow">aibox</p><h1>${PROJECT}</h1>
+<p class="eyebrow">aibox</p>
+<div class="hrow"><h1>${PROJECT}</h1><button class="newb" id="new">New session</button></div>
 <p class="status"><span class="dot"></span><span id="st">Loading…</span></p>
 <div class="card" id="list"><div class="empty">Loading…</div></div>
 <p class="hint">Resuming brings a session back within a few seconds — it also appears in the Claude app on your phone.</p>
@@ -868,6 +857,9 @@ function render(list){
     if(s.live){
       const tag=document.createElement("span");tag.className="tag";tag.textContent="Live";row.appendChild(tag);
       const a=document.createElement("a");a.className="open";a.href=url;a.target="_blank";a.textContent="Open";row.appendChild(a);
+      const st=document.createElement("button");st.className="stopb";st.textContent="Stop";
+      st.onclick=()=>{st.disabled=true;fetch("/api/stop?id="+s.id,{method:"POST"}).then(()=>setTimeout(load,1200))};
+      row.appendChild(st);
     }else{
       const b=document.createElement("button");b.className="res";b.textContent="Resume";
       b.onclick=()=>{b.disabled=true;b.textContent="Starting…";
@@ -878,10 +870,31 @@ function render(list){
   });
 }
 function load(){fetch("/api/sessions").then(r=>r.json()).then(render)}
+document.getElementById("new").onclick=()=>{
+  const b=document.getElementById("new");b.disabled=true;b.textContent="Starting…";
+  fetch("/api/new",{method:"POST"}).then(()=>setTimeout(()=>{b.disabled=false;b.textContent="New session";load()},2000));
+};
 load();setInterval(load,15000);
 </script></body></html>`;
 http.createServer((req, res) => {
   const u = new URL(req.url, "http://x");
+  if (req.method === "POST" && u.pathname === "/api/new") {
+    const id = require("crypto").randomUUID();
+    cp.spawn("script", ["-qfc", "claude --session-id " + id + " --remote-control", "/dev/null"],
+      { detached: true, stdio: "ignore", cwd: process.cwd() }).unref();
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, id: id }));
+  }
+  if (req.method === "POST" && u.pathname === "/api/stop") {
+    const id = String(u.searchParams.get("id") || "");
+    if (!/^[0-9a-f-]{36}$/.test(id)) { res.writeHead(400); return res.end("bad id"); }
+    // id is regex-vetted above, so interpolating it into the shell is safe
+    cp.exec("pkill -f -- \"(--resume|--session-id)[= ]" + id + "\" || true", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{\"ok\":true}");
+    });
+    return;
+  }
   if (req.method === "POST" && u.pathname === "/api/resume") {
     const id = String(u.searchParams.get("id") || "");
     if (!/^[0-9a-f-]{36}$/.test(id)) { res.writeHead(400); return res.end("bad id"); }
@@ -906,19 +919,8 @@ UIJS
       exec node "$HOME/.aibox-serve/ui.js" >>"$HOME/.aibox-serve/ui.log" 2>&1'
   fi
 
-  _ok "Sessions UI: $(_dev_url 45789)"
-  local url="" i=0
-  while (( i++ < 30 )); do
-    url="$(docker exec -u aibox "$CONTAINER" sh -c 'grep -oE "https://claude\.ai/[a-zA-Z0-9/_.-]+" "$HOME/.aibox-serve/rc.log" 2>/dev/null | tail -1')" || true
-    [[ -n "$url" ]] && break
-    sleep 1
-  done
-  if [[ -n "$url" ]]; then
-    _ok "Remote session: ${url} (also in the Claude app's session list)"
-  else
-    _warn "No session URL yet — check the Claude app in a minute, or: aibox shell 'tail ~/.aibox-serve/rc.log'"
-  fi
-  _info "Runs until 'aibox serve stop' — closing this terminal is fine."
+  _ok "Sessions UI: $(_dev_url 45789) — new session, resume, live list."
+  _info "Sessions started there register with claude.ai (Claude app included) and keep running after this terminal closes. End everything with: aibox serve stop"
 }
 
 cmd_stop() {
@@ -995,7 +997,7 @@ cmd_status() {
     echo "Proxy: stopped (starts on next aibox run)"
   fi
   if [[ "$(_state "$CONTAINER")" == "running" ]] \
-     && docker exec -u aibox "$CONTAINER" pgrep -f aibox-serve-rc >/dev/null 2>&1; then
+     && docker exec -u aibox "$CONTAINER" pgrep -f aibox-serve-ui >/dev/null 2>&1; then
     echo "Serve (${SLUG}): running — sessions UI $(_dev_url 45789)"
   fi
   if docker volume inspect "$VOLUME" >/dev/null 2>&1; then

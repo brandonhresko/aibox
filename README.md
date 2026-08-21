@@ -51,7 +51,7 @@ Works out of the box in Chrome, Edge, and Firefox (`*.localhost` resolves to loo
 aibox serve
 ```
 
-keeps a [Claude Code Remote Control](https://code.claude.com/docs/en/remote-control) server running inside the project's container — detached, so closing the terminal changes nothing — and sessions are driven from claude.ai/code or the Claude phone app. It's outbound-only HTTPS: no ports, nothing exposed. Alongside it, a small sessions UI at `http://45789.<project>.aibox.localhost` lists the project's past sessions; clicking **Resume** brings one back as a live remote session (it appears in the app's session list within seconds, and any Claude session can do the same trick on request — the shared CLAUDE.md explains it to them). `aibox serve stop` ends everything. On a remote Linux box, reach the UI with `ssh -L 8080:127.0.0.1:80 host` and open the same URL with `:8080`; the phone side needs no tunnel at all.
+runs a small sessions UI at `http://45789.<project>.aibox.localhost`. **New session** starts a fresh session you drive from claude.ai/code or the Claude phone app ([Remote Control](https://code.claude.com/docs/en/remote-control)); **Resume** brings any past session back the same way; live sessions show as such and can be stopped. Every session is one detached claude process inside the project's container — closing your terminal changes nothing, and registration is outbound-only HTTPS (no ports, nothing exposed). Any Claude session can pull the same tricks on request — the shared CLAUDE.md teaches it the commands, so you can also say "start me a new session" from your phone in any live chat. `aibox serve stop` ends the UI and every live session. On a remote Linux box, reach the UI with `ssh -L 8080:127.0.0.1:80 host` and open the same URL with `:8080`; the phone side needs no tunnel at all.
 
 ## Backup & restore
 
@@ -85,7 +85,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 |---------|-------------|
 | `aibox` / `aibox claude [args]` | Shorthand for `aibox run claude`. `--yolo` skips all permission prompts; `--copy` uses a disposable snapshot container (no bind mount, removed on exit); other args pass through verbatim (`--resume`, `-p`, ...). `aibox --resume` works too |
 | `aibox run [--copy] <prog> [args]` | Run any program in the sandbox (e.g. `aibox run codex`). `--copy` works the same as above; the program's own flags pass through |
-| `aibox serve [args]` | Keep a `claude remote-control` server + sessions UI running in the container — drive sessions from your phone/claude.ai, revive past sessions with a click. `aibox serve stop` ends it |
+| `aibox serve` | Sessions UI in the container: start new phone/claude.ai-drivable sessions, resume past ones, stop live ones. `aibox serve stop` ends the UI and every live session |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
 | `aibox stop [--all]` | Stop this project's container (`--all`: everything incl. proxy). Loses nothing |
 | `aibox status` | Containers with live memory + disk use, dev URLs, Docker disk totals, home volume size |
