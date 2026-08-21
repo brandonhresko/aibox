@@ -5,17 +5,21 @@
 # Claude state. Nothing is ever deleted without asking.
 #
 # Usage:
-#   aibox [claude] [args...]  Start/attach this project's container and run
-#                             Claude Code. Permission prompts are on by
-#                             default, with bypass mode available in-session;
-#                             pass --yolo to skip all prompts from the start.
-#                             Pass --copy for a disposable container on a
-#                             snapshot of the project instead — no bind
-#                             mount, the real directory can't be touched,
-#                             and the container is removed on exit (commit &
-#                             push from inside to keep work).
-#                             Other args pass to claude verbatim (--resume,
-#                             -p, --model, ...). `aibox --resume` works too.
+#   aibox [claude] [args...]  Shorthand for `aibox run claude`: start/attach
+#                             this project's container and run Claude Code.
+#                             Permission prompts are on by default, with
+#                             bypass mode available in-session; pass --yolo
+#                             to skip all prompts from the start. Other args
+#                             pass to claude verbatim (--resume, -p,
+#                             --model, ...). `aibox --resume` works too.
+#   aibox run [--copy] <program> [args...]
+#                             Run any program in the container (e.g.
+#                             aibox run codex). With --copy (also on plain
+#                             aibox/claude), a disposable container on a
+#                             snapshot of the project is used instead — no
+#                             bind mount, the real directory can't be
+#                             touched, and the container is removed on exit
+#                             (commit & push from inside to keep work).
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
 #                             shell string (pipes/globs work); several run
 #                             as a safely-quoted command.
@@ -503,27 +507,43 @@ _ensure_copy_all() {
 }
 
 # ── Commands ─────────────────────────────────────────────────────
-cmd_claude() {
-  # --yolo → bypass permissions from the start; without it, bypass is
-  # available in-session (claude's allow flag) but permissions default on.
-  # --copy → disposable snapshot container instead of the persistent
-  # bind-mounted one.
-  local perm_flag=--allow-dangerously-skip-permissions copy=false
-  local args=() a
+# Run any program in the sandbox. `aibox` / `aibox claude` is just
+# `aibox run claude` (see dispatch). aibox's own flags are consumed wherever
+# they appear in the argv; everything else passes through verbatim:
+#   --copy   disposable snapshot container instead of the persistent
+#            bind-mounted one (any program)
+#   --yolo   claude only: start in bypass-permissions mode; without it,
+#            bypass is available in-session (claude's allow flag) but
+#            permission prompts default on
+cmd_run() {
+  local copy=false yolo=false args=() a
   for a in "$@"; do
     case "$a" in
-      --yolo) perm_flag=--dangerously-skip-permissions ;;
       --copy) copy=true ;;
+      --yolo) yolo=true ;;
       *)      args+=("$a") ;;
     esac
   done
+  [[ ${#args[@]} -ge 1 ]] || _die "Usage: aibox run [--copy] <program> [args...]"
+  if [[ "$yolo" == "true" && "${args[0]}" != "claude" ]]; then
+    _die "--yolo maps to claude's permission flags — pass ${args[0]}'s own approval flags as normal args."
+  fi
+
   if [[ "$copy" == "true" ]]; then
     _ensure_copy_all
   else
     _ensure_all
   fi
-  _ensure_claude_bin
-  _dexec claude "$perm_flag" ${args[@]+"${args[@]}"}
+
+  if [[ "${args[0]}" == "claude" ]]; then
+    _ensure_claude_bin
+    local perm_flag=--allow-dangerously-skip-permissions
+    [[ "$yolo" == "true" ]] && perm_flag=--dangerously-skip-permissions
+    set -- "${args[@]}"; shift   # program args without the leading "claude"
+    _dexec claude "$perm_flag" "$@"
+  else
+    _dexec "${args[@]}"
+  fi
 }
 
 cmd_shell() {
@@ -734,7 +754,8 @@ _check_for_updates
 CMD="${1:-claude}"
 [[ $# -gt 0 ]] && shift
 case "$CMD" in
-  claude)               cmd_claude "$@" ;;
+  claude)               cmd_run claude "$@" ;;
+  run)                  cmd_run "$@" ;;
   shell)                cmd_shell "$@" ;;
   stop)                 cmd_stop "$@" ;;
   status)               cmd_status ;;
@@ -743,6 +764,6 @@ case "$CMD" in
   update)               cmd_update ;;
   version|-v|--version) cmd_version ;;
   help|-h|--help)       cmd_help ;;
-  -*)                   cmd_claude "$CMD" "$@" ;;
+  -*)                   cmd_run claude "$CMD" "$@" ;;
   *)                    _die "Unknown command: ${CMD}. Run 'aibox help' for usage." ;;
 esac

@@ -75,7 +75,8 @@ These were decided explicitly; the rewrite must not relitigate them.
 
 ```
 aibox                      # same as `aibox claude`
-aibox claude [args...]     # ensure image/container/proxy, then run claude inside; --yolo skips all prompts, --copy uses a disposable snapshot container, other args pass through (--resume, -c, etc.)
+aibox claude [args...]     # shorthand for `aibox run claude`; --yolo skips all prompts, --copy uses a disposable snapshot container, other args pass through (--resume, -c, etc.)
+aibox run [--copy] <prog> [args...]  # ensure image/container/proxy, then run any program inside (e.g. aibox run codex)
 aibox shell [cmd...]       # zsh in the container, or run a one-off command
 aibox stop [--all]         # stop this project's container (--all: every aibox container + proxy). Never deletes anything
 aibox status               # all aibox containers: project, state, uptime, image; proxy URLs; volume size
@@ -168,9 +169,13 @@ aibox claude/shell:
   docker exec -it <container> <claude|zsh> ...
 ```
 
-- `claude` is invoked with `--allow-dangerously-skip-permissions` (prompts
+- One generic launcher (`cmd_run`) runs any program in the sandbox;
+  `aibox`/`aibox claude` dispatch to `run claude`. When the program is
+  claude, it is invoked with `--allow-dangerously-skip-permissions` (prompts
   on, bypass selectable in-session) plus any passthrough args; `--yolo`
-  swaps that for `--dangerously-skip-permissions` (all prompts skipped).
+  swaps that for `--dangerously-skip-permissions` (all prompts skipped) and
+  is rejected for other programs (their approval flags pass through as
+  normal args).
 - `--copy` runs claude in a disposable container instead: fresh container
   per run (`<container>-copy-<rand>`, no restart policy, labeled
   `aibox.copy=1` with slug `<slug>-copy` for its own dev URLs), no bind

@@ -31,7 +31,7 @@ aibox                       # 3. run (builds the image on first use)
 - **One shared home volume (`aibox-home`).** Claude login, every session, shell history, and the `claude` binary itself live in a Docker volume mounted at `/home/aibox` in every container. Log in once, resume any session from any project, forever.
 - **Nothing is destroyed implicitly.** Exiting Claude leaves the container running in the background (idle containers cost ~nothing) — the next `aibox` attaches instantly. `aibox stop` stops it; a stopped container keeps everything, including packages you apt-installed. Containers are only recreated when the image changes, and the home volume survives even that.
 - **The container is the sandbox.** Full sudo inside. Permission prompts are on by default, but bypass mode is always available in-session (aibox passes claude's `--allow-dangerously-skip-permissions`); run `aibox --yolo` to start with all prompts skipped (`--dangerously-skip-permissions`).
-- **Disposable copies on demand.** `aibox --copy` runs Claude in a fresh container on a *snapshot* of the project instead — nothing is bind-mounted, so the agent physically can't touch your real files. Same login and session history (shared home volume), own dev URLs (`<port>.<project>-copy.aibox.localhost`). The container is removed when the session exits; keep work by committing and pushing from inside. Each `--copy` run is its own independent sandbox. Combines with `--yolo`.
+- **Disposable copies on demand.** `aibox --copy` runs Claude in a fresh container on a *snapshot* of the project instead — nothing is bind-mounted, so the agent physically can't touch your real files. Same login and session history (shared home volume), own dev URLs (`<port>.<project>-copy.aibox.localhost`). The container is removed when the session exits; keep work by committing and pushing from inside. Each `--copy` run is its own independent sandbox. Combines with `--yolo`, and works for any program via `aibox run <prog> --copy`.
 
 ## Dev servers
 
@@ -75,7 +75,8 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 
 | Command | What it does |
 |---------|-------------|
-| `aibox` / `aibox claude [args]` | Start/attach the project container, run Claude Code. `--yolo` skips all permission prompts; `--copy` uses a disposable snapshot container (no bind mount, removed on exit); other args pass through verbatim (`--resume`, `-p`, ...). `aibox --resume` works too |
+| `aibox` / `aibox claude [args]` | Shorthand for `aibox run claude`. `--yolo` skips all permission prompts; `--copy` uses a disposable snapshot container (no bind mount, removed on exit); other args pass through verbatim (`--resume`, `-p`, ...). `aibox --resume` works too |
+| `aibox run [--copy] <prog> [args]` | Run any program in the sandbox (e.g. `aibox run codex`). `--copy` works the same as above; the program's own flags pass through |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
 | `aibox stop [--all]` | Stop this project's container (`--all`: everything incl. proxy). Loses nothing |
 | `aibox status` | Containers, dev URLs, home volume size |
