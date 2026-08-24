@@ -1105,10 +1105,13 @@ const PORT = 45790, URLBASE = "http://127.0.0.1:" + PORT;
 const IMAGE = process.env.AIBOX_IMAGE, VOLUME = process.env.AIBOX_VOLUME, CFG = process.env.AIBOX_CFG;
 let known = new Set();   // "path\nid" pairs from the last listing — action guards
 function list(cb) {
-  cp.execFile("docker", ["run", "--rm",
+  // --entrypoint bypasses the aibox image entrypoint, which would otherwise
+  // try to install claude into the (empty) image-local home before running
+  // the lister — minutes of hang on every listing.
+  cp.execFile("docker", ["run", "--rm", "--entrypoint", "node",
     "-v", VOLUME + ":/v:ro",
     "-v", CFG + "/sessions-lister.js:/lister.js:ro",
-    IMAGE, "node", "/lister.js"], { maxBuffer: 32 * 1024 * 1024 }, (e, out) => {
+    IMAGE, "/lister.js"], { maxBuffer: 32 * 1024 * 1024 }, (e, out) => {
     let l = [];
     try { l = JSON.parse(out); } catch (err) {}
     known = new Set(l.map(s => s.project + "\n" + s.id));
@@ -1182,7 +1185,7 @@ function act(path,id,ep,okMsg){
 function render(list){
   const el=document.getElementById("list");
   document.getElementById("sub").textContent=list.length+" sessions across "+new Set(list.map(s=>s.project)).size+" projects";
-  if(!list.length){el.innerHTML="<div class=empty>No sessions found in the aibox-home volume.</div>";return}
+  if(!list.length){el.innerHTML="<div class=empty>No sessions found. If you just updated aibox, the volume has not migrated yet — exit sessions, run aibox stop --all, then run aibox in any project once, and Refresh here.</div>";return}
   el.innerHTML="";
   list.forEach(s=>{
     const row=document.createElement("div");row.className="row";
