@@ -1074,6 +1074,17 @@ function title(file) {
   return "Untitled session";
 }
 const out = [];
+function addDir(dir, ppath, label) {
+  let files = []; try { files = fs.readdirSync(dir); } catch (e) { return; }
+  for (const f of files) {
+    if (!f.endsWith(".jsonl")) continue;
+    try {
+      const p = path.join(dir, f), st = fs.statSync(p);
+      out.push({ project: ppath, label: label, id: f.slice(0, -6), mtime: st.mtimeMs, title: title(p) });
+    } catch (e) {}
+  }
+}
+// New layout: per-project slices.
 let hashes = [];
 try { hashes = fs.readdirSync(path.join(ROOT, "projects")); } catch (e) {}
 for (const h of hashes) {
@@ -1082,16 +1093,21 @@ for (const h of hashes) {
   try { ppath = fs.readFileSync(path.join(base, ".aibox-path"), "utf8"); } catch (e) { continue; }
   const cp = path.join(base, "claude-projects");
   let encs = []; try { encs = fs.readdirSync(cp); } catch (e) {}
-  for (const enc of encs) {
-    let files = []; try { files = fs.readdirSync(path.join(cp, enc)); } catch (e) { continue; }
-    for (const f of files) {
-      if (!f.endsWith(".jsonl")) continue;
-      try {
-        const p = path.join(cp, enc, f), st = fs.statSync(p);
-        out.push({ project: ppath, id: f.slice(0, -6), mtime: st.mtimeMs, title: title(p) });
-      } catch (e) {}
-    }
-  }
+  for (const enc of encs) addDir(path.join(cp, enc), ppath, ppath);
+}
+// Legacy / not-yet-migrated layout (and post-migration leftovers). Dir
+// names are lossy encodings; real paths come from .claude.json KEYS with
+// the same rule the migration uses. Unmatched dirs are listed anyway with
+// no project path — the page then offers copy-only.
+const legacyRoot = path.join(ROOT, ".claude", "projects");
+let legacy = []; try { legacy = fs.readdirSync(legacyRoot); } catch (e) {}
+if (legacy.length) {
+  const map = {};
+  try {
+    const cj = fs.readFileSync(path.join(ROOT, ".claude", ".claude.json"), "utf8");
+    for (const m of cj.matchAll(/"(\/[^"]*)":/g)) map[m[1].replace(/[^a-zA-Z0-9]/g, "-")] = m[1];
+  } catch (e) {}
+  for (const enc of legacy) addDir(path.join(legacyRoot, enc), map[enc] || "", map[enc] || enc);
 }
 out.sort((a, b) => b.mtime - a.mtime);
 console.log(JSON.stringify(out));
@@ -1184,7 +1200,7 @@ function act(path,id,ep,okMsg){
 }
 function render(list){
   const el=document.getElementById("list");
-  document.getElementById("sub").textContent=list.length+" sessions across "+new Set(list.map(s=>s.project)).size+" projects";
+  document.getElementById("sub").textContent=list.length+" sessions across "+new Set(list.map(s=>s.label)).size+" projects";
   if(!list.length){el.innerHTML="<div class=empty>No sessions found. If you just updated aibox, the volume has not migrated yet — exit sessions, run aibox stop --all, then run aibox in any project once, and Refresh here.</div>";return}
   el.innerHTML="";
   list.forEach(s=>{
@@ -1193,18 +1209,26 @@ function render(list){
     const t=document.createElement("p");t.className="t";t.textContent=s.title;
     const m=document.createElement("p");m.className="m";
     const chip=document.createElement("span");chip.className="chip";
-    chip.textContent=s.project.split("/").filter(Boolean).pop()||s.project;
-    m.appendChild(chip);m.appendChild(document.createTextNode(ago(s.mtime)+" · "+s.project));
+    chip.textContent=s.label.split("/").filter(Boolean).pop()||s.label;
+    m.appendChild(chip);m.appendChild(document.createTextNode(ago(s.mtime)+" · "+s.label));
     main.appendChild(t);main.appendChild(m);row.appendChild(main);
     const acts=document.createElement("div");acts.className="acts";
-    const bT=document.createElement("button");bT.textContent="Terminal";
-    bT.onclick=()=>act(s.project,s.id,"terminal","Opening a terminal…");
+    if(s.project){
+      const bT=document.createElement("button");bT.textContent="Terminal";
+      bT.onclick=()=>act(s.project,s.id,"terminal","Opening a terminal…");
+      acts.appendChild(bT);
+    }
     const bC=document.createElement("button");bC.textContent="Copy";
-    bC.onclick=()=>{navigator.clipboard.writeText("cd "+JSON.stringify(s.project)+" && aibox --resume "+s.id)
-      .then(()=>say("Command copied — paste it into any tab."))};
-    const bP=document.createElement("button");bP.textContent="Phone";
-    bP.onclick=()=>act(s.project,s.id,"rc","Registering — watch the Claude app list.");
-    acts.appendChild(bT);acts.appendChild(bC);acts.appendChild(bP);row.appendChild(acts);
+    bC.onclick=()=>{
+      const cmd=s.project?("cd "+JSON.stringify(s.project)+" && aibox --resume "+s.id):("aibox --resume "+s.id);
+      navigator.clipboard.writeText(cmd).then(()=>say(s.project?"Command copied — paste it into any tab.":"Copied — run it inside that project directory (path unknown for this one)."))};
+    acts.appendChild(bC);
+    if(s.project){
+      const bP=document.createElement("button");bP.textContent="Phone";
+      bP.onclick=()=>act(s.project,s.id,"rc","Registering — watch the Claude app list.");
+      acts.appendChild(bP);
+    }
+    row.appendChild(acts);
     el.appendChild(row);
   });
 }
