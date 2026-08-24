@@ -1086,17 +1086,27 @@ function info(file, size) {
     }
   }
   const tl = (tail || head).split("\n");
-  let tailSummary = "";
+  let tailSummary = "", lastUser = "";
   for (let i = tl.length - 1; i >= 0; i--) {
     const j = parseLine(tl[i]); if (!j) continue;
     if (!tailSummary && j.type === "summary" && j.summary) tailSummary = j.summary;
     if (!last && j.type === "assistant" && j.message) {
       const t = msgText(j.message);
-      if (t) last = t.slice(0, 160);
+      if (t) last = t.slice(0, 2000);
     }
-    if (last && tailSummary) break;
+    if (!lastUser && j.type === "user" && j.message && !j.isMeta) {
+      const t = msgText(j.message);
+      if (t && !t.startsWith("Caveat:") && !t.startsWith("<command-")) lastUser = t.slice(0, 500);
+    }
+    if (last && lastUser && tailSummary) break;
   }
-  return { title: (tailSummary || summary || firstUser || "Untitled session").slice(0, 90), last: last };
+  const sum = tailSummary || summary;
+  return {
+    title: (sum || firstUser || "Untitled session").slice(0, 100),
+    summary: sum.slice(0, 600),
+    last: last,
+    lastUser: lastUser
+  };
 }
 const out = [];
 function addDir(dir, ppath, label) {
@@ -1105,7 +1115,8 @@ function addDir(dir, ppath, label) {
     if (!f.endsWith(".jsonl")) continue;
     try {
       const p = path.join(dir, f), st = fs.statSync(p), inf = info(p, st.size);
-      out.push({ project: ppath, label: label, id: f.slice(0, -6), mtime: st.mtimeMs, title: inf.title, last: inf.last });
+      out.push({ project: ppath, label: label, id: f.slice(0, -6), mtime: st.mtimeMs,
+                 title: inf.title, summary: inf.summary, last: inf.last, lastUser: inf.lastUser });
     } catch (e) {}
   }
 }
@@ -1219,10 +1230,18 @@ h1{margin:0;font-size:28px;font-weight:700;letter-spacing:-.02em}
 .live{font-size:11.5px;font-weight:700;color:#B45309;background:#FDECCF;border-radius:6px;padding:2px 8px}
 @media(prefers-color-scheme:dark){.live{color:#F0C077;background:#3A2A12}}
 .path{overflow-wrap:anywhere}
+.head{display:flex;align-items:flex-start;gap:10px;cursor:pointer}
+.chev{flex:none;color:var(--muted);font-size:11px;margin-top:5px;transition:transform .15s ease}
+.row.open .chev{transform:rotate(90deg)}
+.hmain{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px}
 .t{margin:0;font-size:15.5px;font-weight:600;letter-spacing:-.005em;overflow-wrap:anywhere}
 .last{margin:0;font-size:13px;color:var(--muted);overflow-wrap:anywhere;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.last b{font-weight:600;font-style:normal;color:var(--muted)}
+.row.open .last{display:none}
+.detail{display:none;background:var(--bg);border-radius:10px;padding:14px 16px;flex-direction:column;gap:14px}
+.row.open .detail{display:flex}
+.dl{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 4px}
+.dt{margin:0;font-size:13.5px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow-y:auto}
 .acts{display:flex;gap:8px;flex-wrap:wrap}
 .acts button{font-family:inherit;font-size:13px;font-weight:600;border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:8px;padding:7px 14px;cursor:pointer}
 .acts button:hover{border-color:var(--accent);color:var(--accent)}
@@ -1263,14 +1282,28 @@ function render(list){
   list.forEach(s=>{
     const active=isActive(s);
     const row=el("div","row");
-    row.appendChild(el("p","t",s.title));
-    if(s.last){const le=el("p","last");le.innerHTML="<b>Last reply:</b> ";le.appendChild(document.createTextNode(s.last));row.appendChild(le)}
+    // Clickable header: expands the row to the summary + full last reply.
+    const head=el("div","head");
+    head.appendChild(el("span","chev","▶"));
+    const hmain=el("div","hmain");
+    hmain.appendChild(el("p","t",s.title));
+    if(s.last)hmain.appendChild(el("p","last",s.last));
     const meta=el("div","meta");
     meta.appendChild(el("span","chip",s.label.split("/").filter(Boolean).pop()||s.label));
     if(active)meta.appendChild(el("span","live","● active now"));
     meta.appendChild(el("span",null,ago(s.mtime)));
     meta.appendChild(el("span","path","· "+s.label));
-    row.appendChild(meta);
+    hmain.appendChild(meta);
+    head.appendChild(hmain);
+    row.appendChild(head);
+    const detail=el("div","detail");
+    const section=(label,text)=>{const d=el("div");d.appendChild(el("p","dl",label));d.appendChild(el("p","dt",text));detail.appendChild(d)};
+    if(s.summary)section("Summary",s.summary);
+    if(s.lastUser)section("Your last message",s.lastUser);
+    if(s.last)section("Last reply",s.last);
+    if(!s.summary&&!s.last&&!s.lastUser)section("Details","Nothing readable in this transcript yet.");
+    row.appendChild(detail);
+    head.onclick=()=>row.classList.toggle("open");
     const acts=el("div","acts");
     const resume=(fn,warnMsg)=>()=>{ if(active && !confirm(warnMsg)) return; fn(); };
     if(s.project){
