@@ -1152,26 +1152,40 @@ function list(cb) {
   cp.execFile("docker", ["run", "--rm", "--entrypoint", "node",
     "-v", VOLUME + ":/v:ro",
     "-v", CFG + "/sessions-lister.js:/lister.js:ro",
-    IMAGE, "/lister.js"], { maxBuffer: 32 * 1024 * 1024 }, (e, out) => {
+    IMAGE, "/lister.js"], { maxBuffer: 64 * 1024 * 1024 }, (e, out) => {
+    if (e) { known = new Set(); return cb(null, "Could not read sessions (is docker running?). Details in the aibox sessions terminal."), console.error(e.message); }
     let l = [];
-    try { l = JSON.parse(out); } catch (err) {}
+    try { l = JSON.parse(out); } catch (err) { known = new Set(); return cb(null, "Could not parse the session list."); }
     known = new Set(l.map(s => s.project + "\n" + s.id));
-    cb(l);
+    cb(l, null);
   });
 }
 function vetted(u) {
   const p = String(u.searchParams.get("path") || ""), id = String(u.searchParams.get("id") || "");
   // Pathless (legacy-orphan) sessions are copy-only — no shell actions.
-  return p && known.has(p + "\n" + id) ? { p, id } : null;
+  // id is also charset-checked as defense in depth; every branch that
+  // interpolates these into a command still shell-quotes them.
+  if (!p || !/^[0-9a-f-]{36}$/.test(id)) return null;
+  return known.has(p + "\n" + id) ? { p, id } : null;
 }
-const RESUME_SH = 'cd "$1" && exec aibox --resume "$2"';
+// POSIX single-quote a string for embedding in a shell command. Paths and
+// ids reaching a shell come from volume contents (.aibox-path, .claude.json
+// keys, transcript filenames) — treat them as hostile.
+function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+const AIBOX = process.env.AIBOX_BIN || "aibox";
+// argv: $1=project dir, $2=aibox binary, $3=session id (env doesn't reliably
+// survive `open` → LaunchServices, so pass the resolved binary positionally).
+// On failure hold the window open — a bare -e window closes instantly.
+const RESUME_SH = 'cd "$1" && "$2" --resume "$3" || { echo; echo "[exited $?] press Enter to close"; read -r _; }';
 function openTerminal(p, id, cb) {
-  if (process.platform !== "darwin") return cb("Terminal open is macOS-only here — use Copy instead.");
+  if (process.platform !== "darwin") return cb("Opening a terminal is macOS-only — use Copy instead.");
   if (fs.existsSync("/Applications/Ghostty.app")) {
-    cp.execFile("open", ["-na", "Ghostty", "--args", "-e", "bash", "-lc", RESUME_SH, "aibox", p, id],
+    cp.execFile("open", ["-na", "Ghostty", "--args", "-e", "bash", "-lc", RESUME_SH, "aibox", p, AIBOX, id],
       e => cb(e ? "Could not open Ghostty: " + e.message : null));
   } else {
-    const cmd = "cd " + JSON.stringify(p) + " && aibox --resume " + id;
+    // do script runs cmd through a shell, so shq() every component first;
+    // JSON.stringify then makes cmd a valid AppleScript string literal.
+    const cmd = "cd " + shq(p) + " && " + shq(AIBOX) + " --resume " + shq(id);
     cp.execFile("osascript",
       ["-e", "tell application \"Terminal\" to do script " + JSON.stringify(cmd),
        "-e", "tell application \"Terminal\" to activate"],
@@ -1185,28 +1199,37 @@ const PAGE = `<!doctype html><html><head><meta charset="utf-8">
 <style>
 :root{--bg:#F6F7F8;--surface:#FFF;--ink:#23282E;--muted:#78828C;--line:#ECEEF0;--accent:#12808F;--accent-soft:#E7F3F4;--accent-ink:#FFF}
 @media(prefers-color-scheme:dark){:root{--bg:#14181C;--surface:#1D2329;--ink:#E9EDF0;--muted:#8E99A3;--line:#2A323A;--accent:#4FB6C2;--accent-soft:#1C3A3F;--accent-ink:#10161A}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:"Instrument Sans",system-ui,sans-serif;font-size:15px;line-height:1.5}
-.wrap{max-width:720px;margin:0 auto;padding:48px 20px 72px}
-.hrow{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 4px}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Instrument Sans",system-ui,-apple-system,sans-serif;font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.wrap{max-width:760px;margin:0 auto;padding:44px 20px 72px}
+.hrow{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 4px}
 .eyebrow{font-size:12px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 10px}
 h1{margin:0;font-size:28px;font-weight:700;letter-spacing:-.02em}
 .tools{display:flex;gap:8px}
 .tools button{font-family:inherit;font-size:13px;font-weight:600;border:none;border-radius:999px;padding:7px 14px;cursor:pointer;background:var(--accent-soft);color:var(--accent)}
 .tools button:hover{background:var(--accent);color:var(--accent-ink)}
-.sub{font-size:14px;color:var(--muted);margin:0 0 28px}
+.sub{font-size:14px;color:var(--muted);margin:4px 0 24px}
+.banner{background:#FBEDE3;color:#8A4B24;border-radius:10px;padding:12px 16px;font-size:13.5px;margin:0 0 20px}
+@media(prefers-color-scheme:dark){.banner{background:#3A2517;color:#E7B48C}}
 .card{background:var(--surface);border-radius:14px;box-shadow:0 1px 2px rgba(30,40,50,.05),0 4px 16px rgba(30,40,50,.05);overflow:hidden}
-.row{display:flex;align-items:center;gap:14px;padding:16px 20px}
+.row{padding:16px 20px;display:flex;flex-direction:column;gap:10px}
 .row+.row{border-top:1px solid var(--line)}
-.rm{flex:1;min-width:0}
-.t{margin:0 0 2px;font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.last{margin:0 0 3px;font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-style:italic}
-.m{margin:0;font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.chip{font-size:11.5px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:6px;padding:2px 8px;margin-right:8px}
-.acts{display:flex;gap:6px;flex:none}
-.acts button{font-family:inherit;font-size:12.5px;font-weight:600;border:1px solid var(--line);background:none;color:var(--ink);border-radius:999px;padding:6px 12px;cursor:pointer}
+.meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px;color:var(--muted)}
+.chip{font-size:11.5px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:6px;padding:2px 8px}
+.live{font-size:11.5px;font-weight:700;color:#B45309;background:#FDECCF;border-radius:6px;padding:2px 8px}
+@media(prefers-color-scheme:dark){.live{color:#F0C077;background:#3A2A12}}
+.path{overflow-wrap:anywhere}
+.t{margin:0;font-size:15.5px;font-weight:600;letter-spacing:-.005em;overflow-wrap:anywhere}
+.last{margin:0;font-size:13px;color:var(--muted);overflow-wrap:anywhere;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.last b{font-weight:600;font-style:normal;color:var(--muted)}
+.acts{display:flex;gap:8px;flex-wrap:wrap}
+.acts button{font-family:inherit;font-size:13px;font-weight:600;border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:8px;padding:7px 14px;cursor:pointer}
 .acts button:hover{border-color:var(--accent);color:var(--accent)}
-.empty{padding:36px 22px;color:var(--muted);text-align:center}
-.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(90px);background:var(--ink);color:var(--bg);font-size:13.5px;font-weight:500;padding:10px 18px;border-radius:999px;transition:transform .25s ease;max-width:90vw}
+.acts button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.acts button.primary:hover{filter:brightness(1.08);color:var(--accent-ink)}
+.empty{padding:40px 22px;color:var(--muted);text-align:center;line-height:1.6}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(120px);background:var(--ink);color:var(--bg);font-size:13.5px;font-weight:500;padding:11px 20px;border-radius:999px;box-shadow:0 6px 24px rgba(0,0,0,.18);transition:transform .25s ease;max-width:calc(100vw - 32px)}
 .toast.show{transform:translateX(-50%) translateY(0)}
 @media(prefers-reduced-motion:reduce){.toast{transition:none}}
 </style></head><body><div class="wrap">
@@ -1214,63 +1237,84 @@ h1{margin:0;font-size:28px;font-weight:700;letter-spacing:-.02em}
 <div class="hrow"><h1>Sessions</h1><div class="tools">
 <button id="refresh">Refresh</button><button id="close">Close</button></div></div>
 <p class="sub" id="sub">Loading…</p>
+<div id="banner"></div>
 <div class="card" id="list"><div class="empty">Loading…</div></div>
 </div><div class="toast" id="toast" role="status"></div><script>
 const toast=document.getElementById("toast");let tt;
-function say(m){toast.textContent=m;toast.classList.add("show");clearTimeout(tt);tt=setTimeout(()=>toast.classList.remove("show"),3000)}
+function say(m){toast.textContent=m;toast.classList.add("show");clearTimeout(tt);tt=setTimeout(()=>toast.classList.remove("show"),3400)}
 function ago(ms){const s=(Date.now()-ms)/1e3;if(s<90)return "just now";const m=s/60,h=m/60,d=h/24;
   if(m<90)return Math.round(m)+" min ago";if(h<36)return Math.round(h)+" hr ago";
   if(d<10)return Math.round(d)+" days ago";return Math.round(d/7)+" wk ago"}
+function shq(s){return "'"+String(s).replace(/'/g,"'\\''")+"'"}
 function act(path,id,ep,okMsg){
   const q="?path="+encodeURIComponent(path)+"&id="+encodeURIComponent(id);
-  fetch("/api/"+ep+q,{method:"POST"}).then(r=>r.json()).then(j=>say(j.error||okMsg)).catch(()=>say("Server stopped."))
+  fetch("/api/"+ep+q,{method:"POST"}).then(r=>r.json()).then(j=>say(j.error||okMsg)).catch(()=>say("Server stopped — restart aibox sessions."))
 }
+// A session touched within ~2 min is very likely open in a terminal right
+// now; resuming it starts a SECOND claude on the same conversation.
+function isActive(s){return Date.now()-s.mtime < 120000}
+function el(tag,cls,txt){const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e}
 function render(list){
-  const el=document.getElementById("list");
-  document.getElementById("sub").textContent=list.length+" sessions across "+new Set(list.map(s=>s.label)).size+" projects";
-  if(!list.length){el.innerHTML="<div class=empty>No sessions found. If you just updated aibox, the volume has not migrated yet — exit sessions, run aibox stop --all, then run aibox in any project once, and Refresh here.</div>";return}
-  el.innerHTML="";
+  document.getElementById("sub").textContent=
+    list.length+" session"+(list.length===1?"":"s")+" across "+new Set(list.map(s=>s.label)).size+" project"+(new Set(list.map(s=>s.label)).size===1?"":"s");
+  const box=document.getElementById("list");
+  if(!list.length){box.innerHTML="<div class=empty>No sessions found in the aibox-home volume.<br>If you just updated aibox and see this, check that Docker is running, then Refresh.</div>";return}
+  box.innerHTML="";
   list.forEach(s=>{
-    const row=document.createElement("div");row.className="row";
-    const main=document.createElement("div");main.className="rm";
-    const t=document.createElement("p");t.className="t";t.textContent=s.title;
-    main.appendChild(t);
-    if(s.last){const le=document.createElement("p");le.className="last";le.textContent="↳ "+s.last;main.appendChild(le)}
-    const m=document.createElement("p");m.className="m";
-    const chip=document.createElement("span");chip.className="chip";
-    chip.textContent=s.label.split("/").filter(Boolean).pop()||s.label;
-    m.appendChild(chip);m.appendChild(document.createTextNode(ago(s.mtime)+" · "+s.label));
-    main.appendChild(m);row.appendChild(main);
-    const acts=document.createElement("div");acts.className="acts";
+    const active=isActive(s);
+    const row=el("div","row");
+    row.appendChild(el("p","t",s.title));
+    if(s.last){const le=el("p","last");le.innerHTML="<b>Last reply:</b> ";le.appendChild(document.createTextNode(s.last));row.appendChild(le)}
+    const meta=el("div","meta");
+    meta.appendChild(el("span","chip",s.label.split("/").filter(Boolean).pop()||s.label));
+    if(active)meta.appendChild(el("span","live","● active now"));
+    meta.appendChild(el("span",null,ago(s.mtime)));
+    meta.appendChild(el("span","path","· "+s.label));
+    row.appendChild(meta);
+    const acts=el("div","acts");
+    const resume=(fn,warnMsg)=>()=>{ if(active && !confirm(warnMsg)) return; fn(); };
     if(s.project){
-      const bT=document.createElement("button");bT.textContent="Terminal";
-      bT.onclick=()=>act(s.project,s.id,"terminal","Opening a terminal…");
+      const bT=el("button",active?null:"primary","Open in terminal");
+      bT.onclick=resume(()=>act(s.project,s.id,"terminal","Opening a terminal…"),
+        "This session looks active in another window. Opening it here starts a SECOND Claude on the same conversation. Continue?");
       acts.appendChild(bT);
     }
-    const bC=document.createElement("button");bC.textContent="Copy";
+    const bC=el("button",null,"Copy resume command");
     bC.onclick=()=>{
-      const cmd=s.project?("cd "+JSON.stringify(s.project)+" && aibox --resume "+s.id):("aibox --resume "+s.id);
-      navigator.clipboard.writeText(cmd).then(()=>say(s.project?"Command copied — paste it into any tab.":"Copied — run it inside that project directory (path unknown for this one)."))};
+      const cmd=s.project?("cd "+shq(s.project)+" && aibox --resume "+s.id):("aibox --resume "+s.id);
+      navigator.clipboard.writeText(cmd).then(
+        ()=>say(s.project?"Copied — paste into any terminal tab.":"Copied — run inside that project directory (its path isn't recorded)."),
+        ()=>say("Copy failed — select the command manually."))};
     acts.appendChild(bC);
     if(s.project){
-      const bP=document.createElement("button");bP.textContent="Phone";
-      bP.onclick=()=>act(s.project,s.id,"rc","Registering — watch the Claude app list.");
+      const bP=el("button",null,"Send to phone");
+      bP.onclick=resume(()=>act(s.project,s.id,"rc","Registering — watch the Claude app’s session list."),
+        "This session looks active in another window. Sending it to your phone starts a SECOND Claude on the same conversation. Continue?");
       acts.appendChild(bP);
     }
     row.appendChild(acts);
-    el.appendChild(row);
+    box.appendChild(row);
   });
 }
-function load(){fetch("/api/sessions").then(r=>r.json()).then(render).catch(()=>say("Server stopped."))}
+function load(){
+  fetch("/api/sessions").then(r=>r.json()).then(d=>{
+    document.getElementById("banner").innerHTML = d.error ? "<div class=banner>"+d.error+"</div>" : "";
+    render(d.sessions||[]);
+  }).catch(()=>say("Server stopped — restart aibox sessions."))
+}
 document.getElementById("refresh").onclick=load;
 document.getElementById("close").onclick=()=>{fetch("/api/close",{method:"POST"}).finally(()=>{
-  document.body.innerHTML="<div class=wrap><p class=sub>aibox sessions stopped — you can close this tab.</p></div>"})};
+  document.body.innerHTML="<div class=wrap><p class=eyebrow>aibox</p><p class=sub>Sessions page stopped. You can close this tab.</p></div>"})};
 load();
 </script></body></html>`;
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
+  const json = (o, code) => { res.writeHead(code || 200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+  // Only same-origin loopback callers: blocks other sites (and DNS-rebinding
+  // pages) from driving this server via the browser.
+  const host = req.headers.host || "";
+  if (host !== "127.0.0.1:" + PORT && host !== "localhost:" + PORT) { res.writeHead(403); return res.end("forbidden"); }
   let u;
-  try { u = new URL(req.url, URLBASE); } catch (e) { res.writeHead(400); return res.end("bad request"); }
-  const json = o => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+  try { u = new URL(req.url, URLBASE); } catch (e) { return json({ error: "bad request" }, 400); }
   if (req.method === "POST" && u.pathname === "/api/close") {
     json({ ok: true });
     console.log("Closed from the page. Bye.");
@@ -1278,27 +1322,40 @@ http.createServer((req, res) => {
   }
   if (req.method === "POST" && (u.pathname === "/api/terminal" || u.pathname === "/api/rc")) {
     const v = vetted(u);
-    if (!v) { res.writeHead(400); return res.end("unknown session"); }
+    if (!v) return json({ error: "Unknown session — Refresh the page and try again." }, 400);
     if (u.pathname === "/api/terminal") return openTerminal(v.p, v.id, err => json(err ? { error: err } : { ok: true }));
-    cp.execFile("bash", ["-lc", 'cd "$1" && exec aibox rc-resume "$2"', "aibox-sessions", v.p, v.id],
+    // id is regex-vetted in vetted(); path is a positional param (no shell
+    // reinterpretation). AIBOX is the resolved binary, so PATH gaps in the
+    // spawned shell don't matter.
+    cp.execFile("bash", ["-lc", 'cd "$1" && exec "$AIBOX" rc-resume "$2"', "aibox-sessions", v.p, v.id],
+      { env: Object.assign({}, process.env, { AIBOX: AIBOX }) },
       (e, out, serr) => {
         if (e) console.error(String(serr || e.message).trim());
         else console.log(String(out).trim());
-        json(e ? { error: "rc-resume failed — see the aibox sessions terminal." } : { ok: true });
+        json(e ? { error: "Send to phone failed — see the aibox sessions terminal." } : { ok: true });
       });
     return;
   }
-  if (u.pathname === "/api/sessions") return list(l => json(l));
+  if (u.pathname === "/api/sessions") return list((l, err) => json({ sessions: l || [], error: err || null }));
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(PAGE);
-}).listen(PORT, "127.0.0.1", () => {
+});
+server.on("error", e => {
+  console.error(e.code === "EADDRINUSE"
+    ? "aibox sessions is already running (or something holds port " + PORT + "). Open " + URLBASE + ", or stop the other one first."
+    : "aibox sessions server error: " + e.message);
+  process.exit(1);
+});
+server.listen(PORT, "127.0.0.1", () => {
   console.log("aibox sessions: " + URLBASE + "  (Ctrl-C or the Close button to stop)");
   const opener = process.platform === "darwin" ? "open" : "xdg-open";
   cp.execFile(opener, [URLBASE], () => {});
 });
 SESSJS
 
-  AIBOX_IMAGE="$IMAGE" AIBOX_VOLUME="$VOLUME" AIBOX_CFG="$CONFIG_DIR" \
+  local aibox_bin
+  aibox_bin="$(command -v aibox 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+  AIBOX_IMAGE="$IMAGE" AIBOX_VOLUME="$VOLUME" AIBOX_CFG="$CONFIG_DIR" AIBOX_BIN="$aibox_bin" \
     node "${CONFIG_DIR}/sessions-ui.js"
 }
 
