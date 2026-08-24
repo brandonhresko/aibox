@@ -1136,7 +1136,8 @@ function list(cb) {
 }
 function vetted(u) {
   const p = String(u.searchParams.get("path") || ""), id = String(u.searchParams.get("id") || "");
-  return known.has(p + "\n" + id) ? { p, id } : null;
+  // Pathless (legacy-orphan) sessions are copy-only — no shell actions.
+  return p && known.has(p + "\n" + id) ? { p, id } : null;
 }
 const RESUME_SH = 'cd "$1" && exec aibox --resume "$2"';
 function openTerminal(p, id, cb) {
