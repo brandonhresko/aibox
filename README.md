@@ -86,6 +86,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 | `aibox` / `aibox claude [args]` | Shorthand for `aibox run claude`. `--yolo` skips all permission prompts; `--copy` uses a disposable snapshot container (no bind mount, removed on exit); other args pass through verbatim (`--resume`, `-p`, ...). `aibox --resume` works too |
 | `aibox run [--copy] <prog> [args]` | Run any program in the sandbox (e.g. `aibox run codex`). `--copy` works the same as above; the program's own flags pass through |
 | `aibox serve` | Sessions UI in the container: start new phone/claude.ai-drivable sessions, resume past ones, stop live ones. `aibox serve stop` ends the UI and every live session |
+| `aibox sessions` | All projects' sessions on one local page (host-side, loopback-only, foreground). Buttons per session: open in Ghostty/Terminal, copy the resume command, or send to your phone |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
 | `aibox stop [--all]` | Stop this project's container (`--all`: everything incl. proxy). Loses nothing |
 | `aibox status` | Containers with live memory + disk use, dev URLs, Docker disk totals, home volume size |
