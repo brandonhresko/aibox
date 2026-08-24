@@ -1054,24 +1054,49 @@ cmd_sessions() {
 // as JSON on stdout.
 const fs = require("fs"), path = require("path");
 const ROOT = process.env.AIBOX_LIST_ROOT || "/v";
-function title(file) {
+function msgText(m) {
+  const c = m.content;
+  const t = typeof c === "string" ? c : Array.isArray(c) ? c.map(x => x.text || "").join(" ") : "";
+  return t.replace(/\s+/g, " ").trim();
+}
+function parseLine(l) { try { return JSON.parse(l); } catch (e) { return null; } }
+// Title prefers Claude Code's own summary records (what its resume picker
+// shows); falls back to the first real user message. `last` is the tail of
+// the conversation — the most recent assistant text. Reads only a head and
+// a tail window, transcripts can be many MB.
+function info(file, size) {
+  let head = "", tail = "";
   try {
-    const fd = fs.openSync(file, "r"), buf = Buffer.alloc(262144);
-    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    const fd = fs.openSync(file, "r");
+    const rd = (pos, len) => {
+      const b = Buffer.alloc(len), n = fs.readSync(fd, b, 0, len, pos);
+      return b.slice(0, n).toString("utf8");
+    };
+    head = rd(0, 262144);
+    if (size > 262144) tail = rd(Math.max(0, size - 131072), 131072);
     fs.closeSync(fd);
-    for (const line of buf.slice(0, n).toString("utf8").split("\n")) {
-      if (!line.trim()) continue;
-      let j; try { j = JSON.parse(line); } catch (e) { continue; }
-      if (j.type === "user" && j.message && !j.isMeta) {
-        const c = j.message.content;
-        let t = typeof c === "string" ? c : Array.isArray(c) ? c.map(x => x.text || "").join(" ") : "";
-        t = t.replace(/\s+/g, " ").trim();
-        if (!t || t.startsWith("Caveat:") || t.startsWith("<command-")) continue;
-        return t.slice(0, 90);
-      }
+  } catch (e) { return { title: "Untitled session", last: "" }; }
+  let firstUser = "", summary = "", last = "";
+  for (const l of head.split("\n")) {
+    const j = parseLine(l); if (!j) continue;
+    if (j.type === "summary" && j.summary) summary = j.summary;
+    if (!firstUser && j.type === "user" && j.message && !j.isMeta) {
+      const t = msgText(j.message);
+      if (t && !t.startsWith("Caveat:") && !t.startsWith("<command-")) firstUser = t;
     }
-  } catch (e) {}
-  return "Untitled session";
+  }
+  const tl = (tail || head).split("\n");
+  let tailSummary = "";
+  for (let i = tl.length - 1; i >= 0; i--) {
+    const j = parseLine(tl[i]); if (!j) continue;
+    if (!tailSummary && j.type === "summary" && j.summary) tailSummary = j.summary;
+    if (!last && j.type === "assistant" && j.message) {
+      const t = msgText(j.message);
+      if (t) last = t.slice(0, 160);
+    }
+    if (last && tailSummary) break;
+  }
+  return { title: (tailSummary || summary || firstUser || "Untitled session").slice(0, 90), last: last };
 }
 const out = [];
 function addDir(dir, ppath, label) {
@@ -1079,8 +1104,8 @@ function addDir(dir, ppath, label) {
   for (const f of files) {
     if (!f.endsWith(".jsonl")) continue;
     try {
-      const p = path.join(dir, f), st = fs.statSync(p);
-      out.push({ project: ppath, label: label, id: f.slice(0, -6), mtime: st.mtimeMs, title: title(p) });
+      const p = path.join(dir, f), st = fs.statSync(p), inf = info(p, st.size);
+      out.push({ project: ppath, label: label, id: f.slice(0, -6), mtime: st.mtimeMs, title: inf.title, last: inf.last });
     } catch (e) {}
   }
 }
@@ -1174,6 +1199,7 @@ h1{margin:0;font-size:28px;font-weight:700;letter-spacing:-.02em}
 .row+.row{border-top:1px solid var(--line)}
 .rm{flex:1;min-width:0}
 .t{margin:0 0 2px;font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.last{margin:0 0 3px;font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-style:italic}
 .m{margin:0;font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .chip{font-size:11.5px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:6px;padding:2px 8px;margin-right:8px}
 .acts{display:flex;gap:6px;flex:none}
@@ -1208,11 +1234,13 @@ function render(list){
     const row=document.createElement("div");row.className="row";
     const main=document.createElement("div");main.className="rm";
     const t=document.createElement("p");t.className="t";t.textContent=s.title;
+    main.appendChild(t);
+    if(s.last){const le=document.createElement("p");le.className="last";le.textContent="↳ "+s.last;main.appendChild(le)}
     const m=document.createElement("p");m.className="m";
     const chip=document.createElement("span");chip.className="chip";
     chip.textContent=s.label.split("/").filter(Boolean).pop()||s.label;
     m.appendChild(chip);m.appendChild(document.createTextNode(ago(s.mtime)+" · "+s.label));
-    main.appendChild(t);main.appendChild(m);row.appendChild(main);
+    main.appendChild(m);row.appendChild(main);
     const acts=document.createElement("div");acts.className="acts";
     if(s.project){
       const bT=document.createElement("button");bT.textContent="Terminal";
