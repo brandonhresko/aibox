@@ -1054,6 +1054,26 @@ cmd_sessions() {
 // as JSON on stdout.
 const fs = require("fs"), path = require("path");
 const ROOT = process.env.AIBOX_LIST_ROOT || "/v";
+// Deep search: with AIBOX_SEARCH set, only sessions whose metadata OR full
+// transcript contains the (case-insensitive) query are emitted.
+const Q = (process.env.AIBOX_SEARCH || "").toLowerCase().slice(0, 200);
+function fileHas(p, q) {
+  try {
+    const fd = fs.openSync(p, "r"), CH = 4 * 1024 * 1024, b = Buffer.alloc(CH);
+    let pos = 0, carry = "";
+    for (;;) {
+      const n = fs.readSync(fd, b, 0, CH, pos);
+      if (n <= 0) break;
+      const s = carry + b.slice(0, n).toString("utf8");
+      if (s.toLowerCase().includes(q)) { fs.closeSync(fd); return true; }
+      carry = s.slice(-q.length);   // query straddling a chunk boundary
+      pos += n;
+      if (n < CH) break;
+    }
+    fs.closeSync(fd);
+  } catch (e) {}
+  return false;
+}
 function msgText(m) {
   const c = m.content;
   const t = typeof c === "string" ? c : Array.isArray(c) ? c.map(x => x.text || "").join(" ") : "";
@@ -1115,6 +1135,10 @@ function addDir(dir, ppath, label) {
     if (!f.endsWith(".jsonl")) continue;
     try {
       const p = path.join(dir, f), st = fs.statSync(p), inf = info(p, st.size);
+      if (Q) {
+        const meta = (inf.title + " " + inf.summary + " " + inf.last + " " + inf.lastUser + " " + label + " " + f).toLowerCase();
+        if (!meta.includes(Q) && !fileHas(p, Q)) continue;
+      }
       out.push({ project: ppath, label: label, id: f.slice(0, -6), mtime: st.mtimeMs,
                  title: inf.title, summary: inf.summary, last: inf.last, lastUser: inf.lastUser });
     } catch (e) {}
@@ -1156,14 +1180,17 @@ const http = require("http"), fs = require("fs"), cp = require("child_process");
 const PORT = 45790, URLBASE = "http://127.0.0.1:" + PORT;
 const IMAGE = process.env.AIBOX_IMAGE, VOLUME = process.env.AIBOX_VOLUME, CFG = process.env.AIBOX_CFG;
 let known = new Set();   // "path\nid" pairs from the last listing — action guards
-function list(cb) {
+function list(cb, q) {
   // --entrypoint bypasses the aibox image entrypoint, which would otherwise
   // try to install claude into the (empty) image-local home before running
-  // the lister — minutes of hang on every listing.
-  cp.execFile("docker", ["run", "--rm", "--entrypoint", "node",
+  // the lister — minutes of hang on every listing. q (deep search) travels
+  // as an env var: argv only, no shell anywhere.
+  const args = ["run", "--rm", "--entrypoint", "node",
     "-v", VOLUME + ":/v:ro",
-    "-v", CFG + "/sessions-lister.js:/lister.js:ro",
-    IMAGE, "/lister.js"], { maxBuffer: 64 * 1024 * 1024 }, (e, out) => {
+    "-v", CFG + "/sessions-lister.js:/lister.js:ro"];
+  if (q) args.push("-e", "AIBOX_SEARCH=" + q);
+  args.push(IMAGE, "/lister.js");
+  cp.execFile("docker", args, { maxBuffer: 64 * 1024 * 1024 }, (e, out) => {
     if (e) { known = new Set(); return cb(null, "Could not read sessions (is docker running?). Details in the aibox sessions terminal."), console.error(e.message); }
     let l = [];
     try { l = JSON.parse(out); } catch (err) { known = new Set(); return cb(null, "Could not parse the session list."); }
@@ -1219,7 +1246,11 @@ h1{margin:0;font-size:28px;font-weight:700;letter-spacing:-.02em}
 .tools{display:flex;gap:8px}
 .tools button{font-family:inherit;font-size:13px;font-weight:600;border:none;border-radius:999px;padding:7px 14px;cursor:pointer;background:var(--accent-soft);color:var(--accent)}
 .tools button:hover{background:var(--accent);color:var(--accent-ink)}
-.sub{font-size:14px;color:var(--muted);margin:4px 0 24px}
+.sub{font-size:14px;color:var(--muted);margin:4px 0 16px}
+.search{margin:0 0 18px}
+.search input{width:100%;font-family:inherit;font-size:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);outline:none}
+.search input:focus{border-color:var(--accent)}
+.search input::placeholder{color:var(--muted)}
 .banner{background:#FBEDE3;color:#8A4B24;border-radius:10px;padding:12px 16px;font-size:13.5px;margin:0 0 20px}
 @media(prefers-color-scheme:dark){.banner{background:#3A2517;color:#E7B48C}}
 .card{background:var(--surface);border-radius:14px;box-shadow:0 1px 2px rgba(30,40,50,.05),0 4px 16px rgba(30,40,50,.05);overflow:hidden}
@@ -1256,6 +1287,8 @@ h1{margin:0;font-size:28px;font-weight:700;letter-spacing:-.02em}
 <div class="hrow"><h1>Sessions</h1><div class="tools">
 <button id="refresh">Refresh</button><button id="close">Close</button></div></div>
 <p class="sub" id="sub">Loading…</p>
+<div class="search"><input id="q" type="search"
+  placeholder="Search titles and previews — press Enter to search inside full transcripts"></div>
 <div id="banner"></div>
 <div class="card" id="list"><div class="empty">Loading…</div></div>
 </div><div class="toast" id="toast" role="status"></div><script>
@@ -1329,12 +1362,32 @@ function render(list){
     box.appendChild(row);
   });
 }
+let ALL=[];
+function banner(msg){document.getElementById("banner").innerHTML=msg?"<div class=banner></div>":"";
+  if(msg)document.querySelector(".banner").textContent=msg}
 function load(){
   fetch("/api/sessions").then(r=>r.json()).then(d=>{
-    document.getElementById("banner").innerHTML = d.error ? "<div class=banner>"+d.error+"</div>" : "";
-    render(d.sessions||[]);
+    banner(d.error);
+    ALL=d.sessions||[];
+    const q=document.getElementById("q").value.trim();
+    render(q?clientFilter(q):ALL);
   }).catch(()=>say("Server stopped — restart aibox sessions."))
 }
+function clientFilter(q){q=q.toLowerCase();
+  return ALL.filter(s=>(s.title+" "+(s.summary||"")+" "+(s.last||"")+" "+(s.lastUser||"")+" "+s.label+" "+s.id).toLowerCase().includes(q))}
+const qEl=document.getElementById("q");
+qEl.addEventListener("input",()=>{const q=qEl.value.trim();render(q?clientFilter(q):ALL)});
+qEl.addEventListener("keydown",e=>{
+  if(e.key!=="Enter")return;
+  const q=qEl.value.trim();
+  if(!q){render(ALL);return}
+  say("Searching inside all transcripts…");
+  fetch("/api/search?q="+encodeURIComponent(q)).then(r=>r.json()).then(d=>{
+    banner(d.error);
+    render(d.sessions||[]);
+    say((d.sessions||[]).length+" transcript match"+((d.sessions||[]).length===1?"":"es")+" — clear the box to see everything again.");
+  }).catch(()=>say("Server stopped — restart aibox sessions."));
+});
 document.getElementById("refresh").onclick=load;
 document.getElementById("close").onclick=()=>{fetch("/api/close",{method:"POST"}).finally(()=>{
   document.body.innerHTML="<div class=wrap><p class=eyebrow>aibox</p><p class=sub>Sessions page stopped. You can close this tab.</p></div>"})};
@@ -1370,6 +1423,10 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (u.pathname === "/api/sessions") return list((l, err) => json({ sessions: l || [], error: err || null }));
+  if (u.pathname === "/api/search") {
+    const q = String(u.searchParams.get("q") || "").trim().slice(0, 200);
+    return list((l, err) => json({ sessions: l || [], error: err || null }), q);
+  }
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(PAGE);
 });
