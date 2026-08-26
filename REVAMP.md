@@ -69,7 +69,7 @@ These were decided explicitly; the rewrite must not relitigate them.
 | D8 | Migration of old data | A **separate standalone script** (not part of the CLI) that merges both live `aibox-auth-*` volumes **and** old backup folders into the new `aibox-home` volume | One-time operation; keeps the CLI clean |
 | D9 | Dev-server access | Host-side reverse proxy with wildcard subdomains: `http://<port>.<project>.aibox.localhost` → container port. Replaces port-forward sidecars and ad-hoc Cloudflare tunnels for local use | `*.localhost` (multi-level included) resolves to loopback natively in Chrome/Edge and Firefox 84+ with zero setup, no sudo, no dnsmasq; Safari only gained this on macOS 26 Tahoe (WebKit bug 160504). CLI tools using the system resolver (curl) don't resolve it — documented workaround, not solved. `/etc/hosts` can't do wildcards, so there is no hosts-file step |
 | D10 | Base image | `node:${node_version}-bookworm` (Debian 12), `node_version` configurable in `~/.aibox/config`, default = current Active LTS (`24` as of mid-2026; Node 22 entered maintenance Oct 2025, Node 20 is EOL) | Debian-based official node images are the standard container base; glibc means nothing is uninstallable. Node version is a one-line config change |
-| D11 | Command surface | Exactly the commands in §3. Everything else is deleted | See §8 for the deletion list |
+| D11 | Command surface | Exactly the commands in §3 (including the post-spec `sessions`/`rc-resume` additions). Everything from v1 outside it is deleted | See §8 for the deletion list |
 
 ## 3. Command surface
 
@@ -79,6 +79,8 @@ aibox claude [args...]     # shorthand for `aibox run claude`; --yolo skips all 
 aibox run [--copy] <prog> [args...]  # ensure image/container/proxy, then run any program inside (e.g. aibox run codex)
 aibox serve                # sessions UI (port 45789) in the container: new/resume/stop phone-drivable sessions, each a detached claude --remote-control process; serve stop ends it all
                            # (known trade-off: the UI binds container-wide for the proxy, so other containers on the aibox network can reach it; its endpoints only spawn/stop THIS project's sessions)
+aibox sessions             # host-side all-projects page (loopback :45790, foreground): expand/search every project's sessions, open in a terminal, copy the resume command, or send to the phone
+aibox rc-resume <id>       # plumbing for the above: make one past session of this project phone-drivable
 aibox shell [cmd...]       # zsh in the container, or run a one-off command
 aibox stop [--all]         # stop this project's container (--all: every aibox container + proxy). Never deletes anything
 aibox status               # all aibox containers: project, state, uptime, image; proxy URLs; volume size
@@ -91,14 +93,15 @@ aibox help
 
 Rules:
 
-- Unknown command → help + exit 1. No interactive prompts anywhere except
+- Unknown command → one-line error with a help hint, exit 1. No interactive prompts anywhere except
   destructive confirmations (`restore`) and first-run niceties.
-- Everything after `claude` passes through to claude **verbatim** — v2 has
-  no global flags, so nothing gets swallowed the way v1's parser ate `-c`
-  (`bin/aibox:251-325`).
+- Everything after `claude` passes through to claude, except aibox's own
+  `--copy`/`--yolo`, which are consumed wherever they appear; a `--` ends
+  aibox flag parsing. Nothing else gets swallowed the way v1's parser ate
+  `-c` (`bin/aibox:251-325`).
 - Allocate a TTY (`docker exec -it`) only when stdin is a terminal, so
   `aibox claude -p "..."` and piped/scripted use work; v1 hard-coded `-it`.
-- `aibox claude` and `aibox shell` are the only commands that create things;
+- `run`/`claude`/`shell`/`serve`/`rc-resume` create everything they need;
   everything they need (image, network, volume, container, proxy) is created
   idempotently on demand. There is no `up`/`build`/`init`.
 - Keep v1's non-blocking update notice (`bin/aibox:2304-2326`): a cached,
@@ -131,8 +134,11 @@ Rules:
 - Plain `docker run` / `docker exec` — **no docker compose**, no generated
   YAML. One container needs no orchestrator, and compose's `down` semantics
   were part of the original footgun.
-- Mounts:
-  - `aibox-home:/home/aibox`
+- Mounts (see D5 — five volume-subpath slices of `aibox-home`):
+  - `projects/<hash6>/home` → `/home/aibox` (private)
+  - `shared/claude-cfg` → `/home/aibox/.claude` (login/settings, shared)
+  - `projects/<hash6>/claude-projects` → `/home/aibox/.claude/projects` (private transcripts)
+  - `shared/local-bin` + `shared/claude-app` → the claude binary (shared)
   - `<project-abs-path>:<project-abs-path>` (bind, rw), workdir = that path
 - `CLAUDE_CONFIG_DIR=/home/aibox/.claude` (unchanged from v1, so existing
   `.claude` contents drop in as-is).
@@ -322,7 +328,9 @@ predictable; nothing in either path can delete data it didn't just save.
   - Steps: (1) require confirmation, (2) automatically run a safety backup
     of the current volume first, (3) stop containers using the volume,
     (4) wipe the volume and extract the archive into it, (5) restart what
-    was running.
+    was running — v2 instead REMOVES aibox containers after restore so the
+    next run recreates them against the restored layout (subpath mounts of a
+    pre-migration backup would not match).
   - Restore is **replace**, not merge — merging heterogeneous histories is
     the migration script's job (§6.1). This keeps restore trivially
     predictable: after restore, the volume equals the backup, and the state
@@ -399,7 +407,9 @@ Removed entirely, with no deprecation shims — v2 is a clean break
   Colima/OrbStack/Docker Desktop stays; installation becomes a printed
   one-liner hint).
 
-Target size: **~500 lines** of bash. If an addition pushes past that,
+Target size was **~500 lines** of bash for the core; the serve/sessions UIs
+(embedded Node, added post-spec) put the final file at ~1,700. If a CORE
+addition pushes past the ballpark,
 something from this spec is being over-built.
 
 ## 9. Non-goals / future ideas
@@ -458,5 +468,5 @@ The rewrite is done when all of these hold:
    zero new files.
 9. Deleting any project container (`docker rm -f`) loses no Claude data —
    next `aibox claude` recreates it and every session is still there.
-10. `grep -c '' bin/aibox` is in the ~500-line ballpark, and no command
-    outside §3 exists.
+10. The core (excluding the embedded serve/sessions UI payloads) stays in
+    the ~500-line ballpark, and no command outside §3 exists.

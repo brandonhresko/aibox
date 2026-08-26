@@ -438,8 +438,8 @@ _wait_running() {
 # current; a volume with old flat data and no marker is migrated in place
 # (safety backup first). Unrecognized files are never moved or deleted.
 
-# The migration body, shared verbatim between the docker run below and the
-# test harness (which runs it against a plain directory via AIBOX_MIG_ROOT).
+# The migration body. AIBOX_MIG_ROOT lets it run against a plain directory
+# instead of the mounted volume, for testing outside docker.
 # POSIX sh — it runs under busybox in the helper image. $1 = hash6 of the
 # project being started, so its slice exists even if it's new.
 # Everything is driven by the absolute-path keys in .claude.json: the
@@ -1050,7 +1050,7 @@ cmd_sessions() {
 
   cat > "${CONFIG_DIR}/sessions-lister.js" <<'LISTER'
 // Runs inside a container with the aibox-home volume mounted read-only at
-// /v (AIBOX_LIST_ROOT overrides for tests). Prints all projects' sessions
+// /v (AIBOX_LIST_ROOT overrides the root, for testing outside docker). Prints all projects' sessions
 // as JSON on stdout.
 const fs = require("fs"), path = require("path");
 const ROOT = process.env.AIBOX_LIST_ROOT || "/v";
