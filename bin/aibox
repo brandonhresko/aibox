@@ -1060,11 +1060,14 @@ const Q = (process.env.AIBOX_SEARCH || "").toLowerCase().slice(0, 200);
 function fileHas(p, q) {
   try {
     const fd = fs.openSync(p, "r"), CH = 4 * 1024 * 1024, b = Buffer.alloc(CH);
+    // StringDecoder buffers a codepoint split across chunk reads — a plain
+    // per-chunk toString would mangle it and silently miss the match.
+    const dec = new (require("string_decoder").StringDecoder)("utf8");
     let pos = 0, carry = "";
     for (;;) {
       const n = fs.readSync(fd, b, 0, CH, pos);
       if (n <= 0) break;
-      const s = carry + b.slice(0, n).toString("utf8");
+      const s = carry + dec.write(b.slice(0, n));
       if (s.toLowerCase().includes(q)) { fs.closeSync(fd); return true; }
       carry = s.slice(-q.length);   // query straddling a chunk boundary
       pos += n;
@@ -1095,7 +1098,7 @@ function info(file, size) {
     head = rd(0, 262144);
     if (size > 262144) tail = rd(Math.max(0, size - 131072), 131072);
     fs.closeSync(fd);
-  } catch (e) { return { title: "Untitled session", last: "" }; }
+  } catch (e) { return { title: "Untitled session", summary: "", last: "", lastUser: "" }; }
   let firstUser = "", summary = "", last = "";
   for (const l of head.split("\n")) {
     const j = parseLine(l); if (!j) continue;
@@ -1191,10 +1194,15 @@ function list(cb, q) {
   if (q) args.push("-e", "AIBOX_SEARCH=" + q);
   args.push(IMAGE, "/lister.js");
   cp.execFile("docker", args, { maxBuffer: 64 * 1024 * 1024 }, (e, out) => {
-    if (e) { known = new Set(); return cb(null, "Could not read sessions (is docker running?). Details in the aibox sessions terminal."), console.error(e.message); }
+    // On errors keep the previous `known` — stale-but-real pairs beat
+    // rejecting every action on rows still visible from the last listing.
+    if (e) { return cb(null, "Could not read sessions (is docker running?). Details in the aibox sessions terminal."), console.error(e.message); }
     let l = [];
-    try { l = JSON.parse(out); } catch (err) { known = new Set(); return cb(null, "Could not parse the session list."); }
-    known = new Set(l.map(s => s.project + "\n" + s.id));
+    try { l = JSON.parse(out); } catch (err) { return cb(null, "Could not parse the session list."); }
+    const pairs = l.map(s => s.project + "\n" + s.id);
+    // Deep-search results are a subset: union them in, so rows from the
+    // cached full list stay actionable; full listings replace (self-heal).
+    if (q) pairs.forEach(x => known.add(x)); else known = new Set(pairs);
     cb(l, null);
   });
 }
@@ -1376,7 +1384,9 @@ function load(){
 function clientFilter(q){q=q.toLowerCase();
   return ALL.filter(s=>(s.title+" "+(s.summary||"")+" "+(s.last||"")+" "+(s.lastUser||"")+" "+s.label+" "+s.id).toLowerCase().includes(q))}
 const qEl=document.getElementById("q");
-qEl.addEventListener("input",()=>{const q=qEl.value.trim();render(q?clientFilter(q):ALL)});
+qEl.addEventListener("input",()=>{const q=qEl.value.trim();
+  if(!q){load();return}   // full reload also resyncs the server's action guard
+  render(clientFilter(q))});
 qEl.addEventListener("keydown",e=>{
   if(e.key!=="Enter")return;
   const q=qEl.value.trim();
@@ -1444,7 +1454,7 @@ server.listen(PORT, "127.0.0.1", () => {
 SESSJS
 
   local aibox_bin
-  aibox_bin="$(command -v aibox 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+  aibox_bin="$(command -v aibox 2>/dev/null || realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
   AIBOX_IMAGE="$IMAGE" AIBOX_VOLUME="$VOLUME" AIBOX_CFG="$CONFIG_DIR" AIBOX_BIN="$aibox_bin" \
     node "${CONFIG_DIR}/sessions-ui.js"
 }
