@@ -41,6 +41,9 @@ Docker runtime
 6. Support practical CPU and memory limits using Docker-native controls.
 7. Remain understandable enough that a user can inspect the generated Docker
    resources and know where work is running.
+8. Allow callers to select a project directory and compatible container image
+   without changing directories or editing the project.
+9. Forward host environment values only when the user names them explicitly.
 
 ## Explicit non-goals
 
@@ -53,6 +56,7 @@ The first prototype will not include:
 - Push notifications, approvals, task boards, or agent orchestration.
 - Automatic worktree or pull-request management.
 - Automatic wildcard domains or a shared Caddy proxy.
+- Automatic installation of Docker, Homebrew, coding agents, or host services.
 - A claim that ordinary Docker containers are equivalent to microVM isolation.
 - Cloud infrastructure provisioning.
 
@@ -104,12 +108,12 @@ explicit opt-in feature.
 The core interface should remain small:
 
 ```text
-aibox up
-aibox run <command> [arguments...]
-aibox shell
-aibox stop
-aibox status
-aibox remove
+aibox [--dir PATH] [--image IMAGE] up
+aibox [--dir PATH] [--image IMAGE] run [--env NAME...] <command> [arguments...]
+aibox [--dir PATH] shell
+aibox [--dir PATH] stop
+aibox [--dir PATH] status
+aibox [--dir PATH] remove
 ```
 
 `aibox run` is the fundamental agent-neutral operation. Examples include:
@@ -121,8 +125,29 @@ aibox run opencode
 aibox run npm test
 ```
 
+`--dir` selects the project without requiring the caller to `cd` first. This is
+part of the core contract because scripts and user-chosen remote tools need a
+stable way to target a project. AI Box canonicalizes the path before deriving
+the sandbox identity and rejects dangerously broad targets such as `/` or the
+user's home directory.
+
 Agent shortcuts may eventually alias `aibox run`, but the core must not depend
 on one agent's session format, remote-control service, or authentication layout.
+
+### Image selection
+
+- AI Box supplies a small default image for the zero-configuration path.
+- `--image IMAGE` allows a caller to select a compatible existing image.
+- Image selection becomes part of the persistent sandbox definition rather than
+  a per-command accident.
+- A changed image may recreate the container but must not delete the project
+  home volume.
+- AI Box validates image names before passing them to Docker.
+- The custom-image contract must be documented before implementation, including
+  the expected user, home path, shell, working directory, and long-running idle
+  process.
+- A user-authored image or Dockerfile extension is the primary escape hatch for
+  language runtimes and coding-agent installation.
 
 ### Agent installation
 
@@ -132,6 +157,20 @@ on one agent's session format, remote-control service, or authentication layout.
   custom image.
 - Optional installation helpers or adapters must remain separable from the
   sandbox lifecycle.
+
+### Environment forwarding
+
+- Do not copy the host environment wholesale into the sandbox.
+- Persisted login state inside the private project home is the preferred agent
+  authentication path.
+- Allow a repeatable explicit option such as `--env NAME` to forward the value
+  of a named exported host variable without placing the value in command
+  history.
+- Do not maintain provider-specific hard-coded lists such as only `ANTHROPIC_*`
+  or `OPENAI_*`.
+- Do not print forwarded secret values in status, logs, or error messages.
+- Environment-file support is deferred until its path, storage, and accidental
+  disclosure behavior are deliberately specified.
 
 ### Lifecycle invariants
 
@@ -155,6 +194,11 @@ on one agent's session format, remote-control service, or authentication layout.
 - Remote access reaches the host through the user's chosen tool, then invokes
   AI Box on that host.
 
+The first post-prototype networking capability should be explicit host-local
+port exposure. It must bind to `127.0.0.1` by default and must not start a public
+tunnel, DNS service, or shared proxy. The user's chosen transport may separately
+make that local endpoint reachable.
+
 ### Resource controls
 
 The prototype should use Docker-native controls for:
@@ -170,6 +214,23 @@ behavior varies by Docker runtime and host filesystem.
 Resource settings belong to the sandbox definition and should remain stable
 between invocations. Global defaults and command-line overrides are sufficient
 for the prototype; AI Box should not write configuration into the project.
+
+### Diagnostics and inspectability
+
+- Verify that the Docker CLI exists and the daemon is reachable, but do not
+  install host dependencies automatically.
+- Return actionable errors for a missing runtime, stopped daemon, incompatible
+  image, unsafe project path, failed mount, and insufficient disk space.
+- Label every Docker resource with its AI Box project identity and canonical
+  host path.
+- `aibox status` should report the project path, container name, image, lifecycle
+  state, configured resource limits, current CPU and memory use, and relevant
+  disk usage.
+- Mount boundaries and forwarded environment variable names must be inspectable;
+  secret values must not be displayed.
+- A larger `doctor`, `disk`, `volumes`, `clean`, or `nuke` command family is not
+  part of the first prototype. Repeated real-world failures may justify a small
+  read-only `doctor` later.
 
 ### Security statement
 
@@ -204,7 +265,28 @@ Two choices should be tested with users before becoming permanent:
 
 Other useful observations include whether users need port publication in their
 first session, which resource limits they understand, and whether custom images
-are sufficient for installing their preferred agents.
+are sufficient for installing their preferred agents. The custom-image
+compatibility contract and the minimum useful environment-forwarding interface
+must also be proven before they are treated as stable public APIs.
+
+## Selected ideas retained from the original main branch
+
+The Claude revamp is already descended from the original `main`; this prototype
+does not merge or cherry-pick that branch. It retains only the concepts that fit
+the narrower execution-layer boundary:
+
+- `--dir PATH` for explicit project selection.
+- `--image IMAGE` and a user-controlled image customization path.
+- Safe project-path and image-name validation.
+- Docker readiness, disk-space, and lifecycle diagnostics.
+- Inspectable Docker labels and useful status/resource reporting.
+- Explicit local port exposure as a deferred capability, redesigned to bind
+  loopback by default.
+
+Named instances, repository cloning, worktree orchestration, editor setup,
+automatic host installation, Claude-specific permission modes, domain
+allowlists, broad cleanup commands, shared `node_modules`, and session-driven
+container shutdown remain intentionally excluded.
 
 ## Prototype success criteria
 
@@ -223,6 +305,14 @@ The prototype is successful when it can demonstrate all of the following:
 9. No UI, relay, tunnel, or agent-specific session service is required.
 10. A user can reach the host using a transport AI Box does not know about and
     enter the same sandbox with a normal AI Box command.
+11. `--dir` targets the same sandbox as running from that project's canonical
+    directory.
+12. A compatible custom image can be selected without weakening persistence or
+    mounting additional host paths.
+13. Only explicitly named environment values enter the sandbox, and their
+    values never appear in status or diagnostic output.
+14. Missing-runtime, unsafe-path, image, mount, and low-disk failures produce
+    actionable messages without modifying the host automatically.
 
 ## Deferred questions
 
@@ -233,6 +323,7 @@ The prototype does not need to settle:
 - Shared authentication across projects.
 - Disposable copies, worktrees, or one-container-per-task workflows.
 - Automatic dev-server URLs and preview routing.
+- Environment files or implicit provider-specific environment forwarding.
 - Backups spanning every project.
 - Stronger microVM-backed isolation.
 - Team, fleet, or multi-user administration.
