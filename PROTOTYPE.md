@@ -666,11 +666,11 @@ prove ownership before touching anything:
   written, or deleted by the CLI. `status` may note that legacy volumes exist.
 - The build fingerprint (section 5.9) prevents reuse of a stale v2 image under
   the same development tag.
-- Publishing metadata: the checkout still carries the upstream remote,
-  `package.json` links to the original repository, and a release workflow
-  targeting the original npm package and Homebrew tap. The workflow is
-  disabled in milestone 1 so a pushed tag cannot attempt a publish; metadata is
-  retargeted in milestone 4 before any distribution.
+- Publishing metadata: the checkout has only the fork's `origin`, but
+  `package.json` still links to the original repository and the disabled
+  release workflow still targets the original npm package and Homebrew tap.
+  Metadata and release ownership are resolved in milestone 4 before any
+  distribution.
 
 ### 5.18 Security statement
 
@@ -833,7 +833,7 @@ message records the smoke run's result.
 | 1. Settle the contract | This document; ShellCheck CI; release workflow disabled; README banner; smoke harness skeleton; synthetic fixture helper | CI green; harness runs and cleans up; nothing in `bin/aibox` changed yet |
 | 2. Smallest useful core | Carved `bin/aibox`: private home, per-project network, labels, `up` (create and start only), `run`, `shell`, `stop`, `status`, `--dir`, `--env`, locking, session markers, readiness, stderr and exit-status rules, foreign-schema refusal | Reuse, concurrent commands, persistence, no unintended mounts, clean output, refusal of the v2 container, Linux ownership check |
 | 3. Make changes dependable | Explicit replacement with rollback, refusal while active, fail-closed inspection, live limits with explicit clearing, `remove` and `--purge`, image fingerprint and `--rebuild`, custom-image validation, `port-forward` | Concurrent `run` plus `up`, replacement failure recovery, active-process and inspection-failure refusal, limits effective and cleared, forwards on loopback surviving replacement |
-| 4. Validate everyday use | Real agent use through derivative images, disconnect survival with `tmux`, the copied v2 fixture resuming, Linux lifecycle run, README rewrite, publishing metadata retargeted, `REVAMP.md` marked historical | All success criteria in section 10 demonstrated; README matches observed behavior |
+| 4. Validate everyday use | Execute [MILESTONE-4-VALIDATION.md](MILESTONE-4-VALIDATION.md): real agent and transport use, disconnect/restart behavior, v2 state-copy acceptance, Linux lifecycle, decision scorecard, README rewrite, publishing metadata retargeting, and historical-doc cleanup | Completed acceptance table with evidence; all success criteria in section 10 demonstrated; README matches observed behavior; size checkpoint resolved |
 
 #### Milestone 1: settle the contract
 
@@ -966,11 +966,30 @@ Exit criteria, each a smoke check unless marked manual:
 
 Scope:
 
+- Use [MILESTONE-4-VALIDATION.md](MILESTONE-4-VALIDATION.md) as the canonical
+  manual procedure and evidence record for this milestone. A result is PASS,
+  FAIL, BLOCKED, or EXPECTED LIMITATION; unavailable external prerequisites
+  are not rewritten as successful AI Box behavior.
 - A derivative image example in the README (`Dockerfile.extra`) that installs
   Claude Code and Codex outside the home directory, and a session of each
   through `aibox run`.
-- Disconnect survival: start an agent under `tmux`, close the terminal,
-  reattach.
+- Local Codex and Claude authentication, bounded project edits, exit, and
+  session resume. Repeat against a second project to measure private-home login
+  friction rather than assuming it is acceptable.
+- Disconnect survival: start an agent under `tmux`, close the terminal, and
+  reattach. Record separately that explicit container stop or Docker restart
+  does not resurrect arbitrary `docker exec` processes.
+- Transport composition: reach the host over SSH and enter the same sandbox
+  with an ordinary AI Box command; drive Claude inside the sandbox through
+  Claude Remote Control from another browser or phone. Codex Remote is an
+  optional composition check and must not be described as automatically
+  placing its host-side process inside AI Box.
+- Real dev-server validation: bind on the container interface, reach it through
+  the loopback-only forward, exercise HMR/WebSockets, and reach that host
+  loopback from another device through an SSH tunnel.
+- Host-availability validation: distinguish terminal disconnect, host sleep,
+  explicit `aibox stop`, and Docker-daemon restart. Only the sandbox and
+  forwarder definitions are expected to restart with Docker.
 - The acceptance fixture: with the v2 container stopped, copy the developer's
   project home and transcripts from the sliced volume into the new per-project
   volume, chown at copy time, and confirm `claude --resume` lists the sessions.
@@ -984,12 +1003,22 @@ Scope:
   `docker rmi` step; smoke and ShellCheck instructions).
 - `package.json` repository, homepage, bugs, description, and `files`
   retargeted to the fork; the release workflow retargeted or removed.
+- Complete the product-decision scorecard for private homes, writable binds,
+  explicit forwarding, `tmux`, derivative images, resource controls, always-on
+  host requirements, and transport neutrality.
+- Resolve the section 9.1 size checkpoint. After milestone 3, `bin/aibox` is
+  approximately 1,375 lines, which is well beyond the “over 800 means stop and
+  reconsider” guide. Either simplify it in a focused pass or explicitly revise
+  the guide with rationale before declaring the prototype done.
 
 Exit criteria:
 
+- Every required row in the validation playbook's final acceptance table is
+  PASS, or an accepted limitation is recorded accurately in this document and
+  the README. BLOCKED is not equivalent to PASS.
 - Every success criterion in section 10 is demonstrated, by the smoke script
   where marked and manually otherwise, and the results are recorded in the
-  milestone commit message.
+  milestone commit message or an attached validation record.
 - The README contains no statement that the smoke script or a manual check
   contradicts.
 
