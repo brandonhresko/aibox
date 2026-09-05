@@ -10,6 +10,7 @@ SCHEMA_VERSION="3"
 NODE_VERSION="24"
 DEFAULT_PIDS="4096"
 CONFIG_DIR="${AIBOX_CONFIG_DIR:-${HOME}/.aibox}"
+FORWARD_IMAGE="${AIBOX_FORWARD_IMAGE:-alpine/socat@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e}"
 
 [[ "$CLI_VERSION" == "__CLI_VERSION__" ]] && CLI_VERSION="dev"
 
@@ -22,6 +23,10 @@ HOME_VOLUME=""
 NETWORK=""
 LOCK_PATH=""
 SESSION_MARKER=""
+VALIDATION_CONTAINER=""
+CONFIG_CPUS="0"
+CONFIG_MEMORY="0"
+CONFIG_PIDS="$DEFAULT_PIDS"
 
 _notice() { printf '%s\n' "$*" >&2; }
 _warn() { printf 'Warning: %s\n' "$*" >&2; }
@@ -34,17 +39,22 @@ aibox - Run commands in a persistent, project-scoped Docker sandbox.
 
 Usage:
   aibox
-  aibox [--dir PATH] up
+  aibox [--dir PATH] up [--image IMAGE] [--cpus N] [--memory SIZE]
+                          [--pids N] [--rebuild]
   aibox [--dir PATH] run [--env NAME]... <command> [arguments...]
   aibox [--dir PATH] shell [command...]
   aibox [--dir PATH] stop [--all]
   aibox [--dir PATH] status
+  aibox [--dir PATH] remove [--purge] [--yes]
+  aibox [--dir PATH] port-forward PORT|HOST_PORT:CONTAINER_PORT ...
+  aibox [--dir PATH] port-forward --list | --stop PORT | --stop-all
   aibox version
   aibox help
 
 The selected project is mounted read/write at the same absolute path. Its
-private /home/aibox volume persists across stop and start. AI Box does not
-install or launch an AI agent, expose ports, or provide remote transport.
+private /home/aibox volume persists across replacement. Port forwards bind
+only to 127.0.0.1. AI Box does not install or launch an AI agent or provide
+remote transport.
 HELP
 }
 
@@ -54,6 +64,51 @@ _sha256() {
   else
     shasum -a 256 | cut -d' ' -f1
   fi
+}
+
+_validate_cpus() {
+  local value="$1" source="$2"
+  if [[ ! "$value" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]; then
+    [[ "$source" == --* ]] && _usage_error "Invalid CPU limit '${value}'; use 0 or a positive number such as 1.5."
+    _die "Invalid CPU limit '${value}' from ${source}; use 0 or a positive number such as 1.5."
+  fi
+}
+
+_validate_memory() {
+  local value="$1" source="$2"
+  if [[ "$value" != "0" && ! "$value" =~ ^[1-9][0-9]*([bBkKmMgG])?$ ]]; then
+    [[ "$source" == --* ]] && _usage_error "Invalid memory limit '${value}'; use 0 or a Docker size such as 256m."
+    _die "Invalid memory limit '${value}' from ${source}; use 0 or a Docker size such as 256m."
+  fi
+}
+
+_validate_pids() {
+  local value="$1" source="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    [[ "$source" == --* ]] && _usage_error "Invalid process limit '${value}'; use 0 or a positive integer."
+    _die "Invalid process limit '${value}' from ${source}; use 0 or a positive integer."
+  fi
+}
+
+_is_zero_number() {
+  awk -v value="$1" 'BEGIN { exit ! (value + 0 == 0) }'
+}
+
+_memory_bytes() {
+  local value="$1" number suffix multiplier=1
+  number="${value%[bBkKmMgG]}"
+  suffix="${value#$number}"
+  case "$suffix" in
+    b|B|"") multiplier=1 ;;
+    k|K) multiplier=1024 ;;
+    m|M) multiplier=1048576 ;;
+    g|G) multiplier=1073741824 ;;
+  esac
+  awk -v number="$number" -v multiplier="$multiplier" 'BEGIN { printf "%.0f\n", number * multiplier }'
+}
+
+_cpus_from_nano() {
+  awk -v nano="$1" 'BEGIN { if (nano == 0) print "0"; else printf "%.9g\n", nano / 1000000000 }'
 }
 
 _load_config() {
@@ -66,6 +121,18 @@ _load_config() {
         [[ "$value" =~ ^[0-9]+$ ]] \
           || _die "Invalid node_version in ${CONFIG_DIR}/config: expected a major version number."
         NODE_VERSION="$value"
+        ;;
+      cpus)
+        _validate_cpus "$value" "${CONFIG_DIR}/config"
+        CONFIG_CPUS="$value"
+        ;;
+      memory)
+        _validate_memory "$value" "${CONFIG_DIR}/config"
+        CONFIG_MEMORY="$value"
+        ;;
+      pids)
+        _validate_pids "$value" "${CONFIG_DIR}/config"
+        CONFIG_PIDS="$value"
         ;;
     esac
   done < "${CONFIG_DIR}/config"
@@ -233,6 +300,9 @@ _cleanup() {
   trap - EXIT HUP INT TERM
   _release_lock
   [[ -n "$SESSION_MARKER" ]] && rm -f -- "$SESSION_MARKER" 2>/dev/null || true
+  if [[ -n "$VALIDATION_CONTAINER" ]]; then
+    docker container rm --force "$VALIDATION_CONTAINER" >/dev/null 2>&1 || true
+  fi
   exit "$AIBOX_EXIT_STATUS"
 }
 
@@ -320,17 +390,74 @@ _image_fingerprint() {
   docker image inspect --format '{{ index .Config.Labels "aibox.build-fingerprint" }}' "$IMAGE" 2>/dev/null || true
 }
 
-_ensure_image() {
-  local wanted current
+_build_default_image() {
+  local wanted
   _write_build_inputs
   wanted="$(_build_fingerprint)"
-  current="$(_image_fingerprint)"
-  [[ "$current" == "$wanted" ]] && return 0
   _check_disk_space
-  _notice "Building ${IMAGE}; this may take a few minutes on first use..."
+  _notice "Building ${IMAGE}; this may take a few minutes..."
   docker build --pull --label "aibox.build-fingerprint=${wanted}" -t "$IMAGE" "$CONFIG_DIR" >&2 \
     || _die "Failed to build ${IMAGE}. Review the Docker output above and retry."
   _notice "Built ${IMAGE}."
+}
+
+_ensure_image() {
+  local force="${1:-false}" wanted current
+  _write_build_inputs
+  wanted="$(_build_fingerprint)"
+  current="$(_image_fingerprint)"
+  if [[ "$force" != true && "$current" == "$wanted" ]]; then
+    return 0
+  fi
+  _build_default_image
+}
+
+_validate_custom_image() {
+  local image="$1" configured_user entrypoint state attempts=0 exit_code logs
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    _die "Custom image '${image}' is not a valid local Docker image. Build or pull it first."
+  fi
+  configured_user="$(docker image inspect --format '{{.Config.User}}' "$image" 2>/dev/null || true)"
+  [[ "$configured_user" == "aibox" ]] \
+    || _die "Custom image '${image}' is incompatible: its configured user must be 'aibox'."
+  entrypoint="$(docker image inspect --format '{{json .Config.Entrypoint}}' "$image" 2>/dev/null || true)"
+  [[ -n "$entrypoint" && "$entrypoint" != "null" && "$entrypoint" != '<no value>' ]] \
+    || _die "Custom image '${image}' is incompatible: it must define a passthrough entrypoint."
+
+  VALIDATION_CONTAINER="aibox-validate-$$-${RANDOM}"
+  if ! docker create --name "$VALIDATION_CONTAINER" "$image" sh -c '
+    test "$(id -u)" = 1000
+    test "$HOME" = /home/aibox
+    command -v sleep >/dev/null
+    printf aibox-validation-ok
+  ' >/dev/null; then
+    docker container rm --force "$VALIDATION_CONTAINER" >/dev/null 2>&1 || true
+    VALIDATION_CONTAINER=""
+    _die "Custom image '${image}' could not be started for compatibility validation."
+  fi
+  if ! docker start "$VALIDATION_CONTAINER" >/dev/null; then
+    docker container rm --force "$VALIDATION_CONTAINER" >/dev/null 2>&1 || true
+    VALIDATION_CONTAINER=""
+    _die "Custom image '${image}' failed its entrypoint validation."
+  fi
+  while :; do
+    state="$(docker container inspect --format '{{.State.Status}}' "$VALIDATION_CONTAINER" 2>/dev/null || true)"
+    [[ "$state" == "exited" || "$state" == "dead" ]] && break
+    attempts=$((attempts + 1))
+    if (( attempts >= 30 )); then
+      docker container rm --force "$VALIDATION_CONTAINER" >/dev/null 2>&1 || true
+      VALIDATION_CONTAINER=""
+      _die "Custom image '${image}' is incompatible: its entrypoint did not pass the validation command through."
+    fi
+    sleep 0.1
+  done
+  exit_code="$(docker container inspect --format '{{.State.ExitCode}}' "$VALIDATION_CONTAINER")"
+  logs="$(docker logs "$VALIDATION_CONTAINER" 2>/dev/null || true)"
+  docker container rm "$VALIDATION_CONTAINER" >/dev/null 2>&1 || true
+  VALIDATION_CONTAINER=""
+  if [[ "$exit_code" != "0" || "$logs" != *aibox-validation-ok* ]]; then
+    _die "Custom image '${image}' is incompatible: require UID 1000, HOME=/home/aibox, sleep, and a passthrough entrypoint."
+  fi
 }
 
 _container_state() {
@@ -369,26 +496,38 @@ _create_support_resources() {
 }
 
 _create_container() {
-  docker create \
-    --name "$SANDBOX" \
-    --hostname "${SLUG:0:63}" \
-    --network "$NETWORK" \
-    --restart unless-stopped \
-    --init \
-    --pids-limit "$DEFAULT_PIDS" \
-    --add-host host.docker.internal:host-gateway \
-    --workdir "$PROJECT_DIR" \
-    --mount "type=bind,src=${PROJECT_DIR},dst=${PROJECT_DIR}" \
-    --mount "type=volume,src=${HOME_VOLUME},dst=/home/aibox" \
-    --label "aibox.schema=${SCHEMA_VERSION}" \
-    --label "aibox.path=${PROJECT_DIR}" \
-    --label "aibox.slug=${SLUG}" \
-    --label "aibox.hash=${HASH}" \
-    --label "aibox.version=${CLI_VERSION}" \
-    --label 'aibox.role=sandbox' \
-    --label 'aibox.image-source=default' \
-    "$IMAGE" sleep infinity >/dev/null \
-    || _die "Could not create ${SANDBOX}. Check the bind path and Docker error above."
+  local target_image="$1" image_source="$2" cpus="$3" memory="$4" pids="$5" restart_policy="$6"
+  local docker_args=(create
+    --name "$SANDBOX"
+    --hostname "${SLUG:0:63}"
+    --network "$NETWORK"
+    --restart "$restart_policy"
+    --init
+    --add-host host.docker.internal:host-gateway
+    --workdir "$PROJECT_DIR"
+    --mount "type=bind,src=${PROJECT_DIR},dst=${PROJECT_DIR}"
+    --mount "type=volume,src=${HOME_VOLUME},dst=/home/aibox"
+    --label "aibox.schema=${SCHEMA_VERSION}"
+    --label "aibox.path=${PROJECT_DIR}"
+    --label "aibox.slug=${SLUG}"
+    --label "aibox.hash=${HASH}"
+    --label "aibox.version=${CLI_VERSION}"
+    --label 'aibox.role=sandbox'
+    --label "aibox.image-source=${image_source}")
+  if ! _is_zero_number "$cpus"; then
+    docker_args+=(--cpus "$cpus")
+  fi
+  if [[ "$memory" != "0" ]]; then
+    docker_args+=(--memory "$memory" --memory-swap "$memory")
+  fi
+  if [[ "$pids" != "0" ]]; then
+    docker_args+=(--pids-limit "$pids")
+  fi
+  # This command runs only after a compatible entrypoint passes control
+  # through, so independent custom images can satisfy the same readiness
+  # protocol without inheriting AI Box's entrypoint.
+  docker_args+=("$target_image" sh -c 'touch /tmp/aibox-ready && exec sleep infinity')
+  docker "${docker_args[@]}" >/dev/null
 }
 
 _wait_ready() {
@@ -397,17 +536,15 @@ _wait_ready() {
     attempts=$((attempts + 1))
     if (( attempts >= 50 )); then
       docker logs "$SANDBOX" >&2 || true
-      _die "Sandbox ${SANDBOX} did not become ready."
+      return 1
     fi
     sleep 0.1
   done
 }
 
-_ensure_sandbox_locked() {
-  local state
+_ensure_entry_sandbox_locked() {
+  local state source
   _assert_project_resources
-  _ensure_image
-  _create_support_resources
   state="$(_container_state)"
 
   if [[ "$state" == "created" ]]; then
@@ -419,12 +556,20 @@ _ensure_sandbox_locked() {
 
   case "$state" in
     absent)
+      _ensure_image false
+      _create_support_resources
       _notice "Creating sandbox ${SANDBOX}..."
-      _create_container
+      _create_container "$IMAGE" default "$CONFIG_CPUS" "$CONFIG_MEMORY" "$CONFIG_PIDS" unless-stopped \
+        || _die "Could not create ${SANDBOX}. Check the bind path and Docker error above."
       docker start "$SANDBOX" >/dev/null || _die "Could not start ${SANDBOX}."
       ;;
-    running) ;;
+    running)
+      source="$(_resource_label container "$SANDBOX" 'aibox.image-source')"
+      [[ "$source" == "default" ]] && _ensure_image false
+      ;;
     exited|dead)
+      source="$(_resource_label container "$SANDBOX" 'aibox.image-source')"
+      [[ "$source" == "default" ]] && _ensure_image false
       _notice "Starting sandbox ${SANDBOX}..."
       docker start "$SANDBOX" >/dev/null || _die "Could not start ${SANDBOX}."
       ;;
@@ -433,20 +578,23 @@ _ensure_sandbox_locked() {
       ;;
     *) _die "Sandbox ${SANDBOX} is ${state}; resolve that Docker state and retry." ;;
   esac
-  _wait_ready
+  _wait_ready || _die "Sandbox ${SANDBOX} did not become ready."
 }
 
 _container_is_stale() {
-  local container_image current_image
+  local container_image current_image configured_image source
   _resource_exists container "$SANDBOX" || return 1
+  source="$(_resource_label container "$SANDBOX" 'aibox.image-source')"
+  [[ "$source" == "default" ]] || return 1
+  configured_image="$(docker container inspect --format '{{.Config.Image}}' "$SANDBOX" 2>/dev/null || true)"
   container_image="$(docker container inspect --format '{{.Image}}' "$SANDBOX" 2>/dev/null || true)"
-  current_image="$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
+  current_image="$(docker image inspect --format '{{.Id}}' "$configured_image" 2>/dev/null || true)"
   [[ -n "$container_image" && -n "$current_image" && "$container_image" != "$current_image" ]]
 }
 
 _warn_if_stale() {
   if _container_is_stale; then
-    _warn "Sandbox ${SANDBOX} uses an older default image. Milestone 2 does not replace existing sandboxes."
+    _warn "Sandbox ${SANDBOX} uses an older default image; run 'aibox up' to replace it when idle."
   fi
 }
 
@@ -496,12 +644,263 @@ _docker_exec() {
   docker "${args[@]}" "$@"
 }
 
+_require_replacement_idle() {
+  local state="$1" sessions activity
+  sessions="$(_active_session_count)"
+  if (( sessions > 0 )); then
+    _die "Refusing to replace ${SANDBOX}: ${sessions} AI Box session(s) are active. Let them finish or run 'aibox stop', then retry 'aibox up'."
+  fi
+  if [[ "$state" == "running" ]]; then
+    activity="$(_activity_state)"
+    case "$activity" in
+      idle) ;;
+      active) _die "Refusing to replace ${SANDBOX}: background processes are active. Stop them or run 'aibox stop', then retry 'aibox up'." ;;
+      *) _die "Refusing to replace ${SANDBOX}: cannot establish safety from Docker process inspection. Run 'aibox stop', then retry 'aibox up'." ;;
+    esac
+  fi
+}
+
+_apply_live_limits() {
+  local cpus_set="$1" cpus="$2" memory_set="$3" memory="$4" pids_set="$5" pids="$6"
+  local current_memory target_memory docker_args=(update)
+  if [[ "$cpus_set" == true ]] && ! _is_zero_number "$cpus"; then
+    docker_args+=(--cpus "$cpus")
+  fi
+  if [[ "$memory_set" == true && "$memory" != "0" ]]; then
+    current_memory="$(docker container inspect --format '{{.HostConfig.Memory}}' "$SANDBOX")"
+    target_memory="$(_memory_bytes "$memory")"
+    if [[ "$current_memory" =~ ^[0-9]+$ ]] && (( current_memory > 0 && target_memory < current_memory )); then
+      _warn "Lowering memory below current usage may trigger reclaim or an out-of-memory kill."
+    fi
+    docker_args+=(--memory "$memory" --memory-swap "$memory")
+  fi
+  if [[ "$pids_set" == true ]]; then
+    if [[ "$pids" == "0" ]]; then
+      docker_args+=(--pids-limit -1)
+    else
+      docker_args+=(--pids-limit "$pids")
+    fi
+  fi
+  if (( ${#docker_args[@]} > 1 )); then
+    docker "${docker_args[@]}" "$SANDBOX" >/dev/null \
+      || _die "Docker rejected the requested live resource update; the Docker error above is authoritative."
+  fi
+}
+
+_restart_forwarders() {
+  local ids id state
+  ids="$(docker ps --all --quiet --filter "label=aibox.schema=${SCHEMA_VERSION}" --filter 'label=aibox.role=forward' --filter "label=aibox.path=${PROJECT_DIR}")"
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    state="$(docker container inspect --format '{{.State.Status}}' "$id")"
+    if [[ "$state" != "running" ]]; then
+      docker start "$id" >/dev/null \
+        || _die "Could not restart forwarder ${id}; its host port may now be in use."
+    fi
+  done <<EOF
+$ids
+EOF
+}
+
+_replace_container() {
+  local old_state="$1" target_image="$2" image_source="$3" cpus="$4" memory="$5" pids="$6" restart_policy="$7"
+  local previous="${SANDBOX}.prev" restored=false
+  if _resource_exists container "$previous"; then
+    _die "Cannot replace ${SANDBOX}: recovery container ${previous} already exists. Inspect it manually before retrying."
+  fi
+
+  _notice "Replacing ${SANDBOX} transactionally..."
+  if [[ "$old_state" == "running" ]]; then
+    docker stop "$SANDBOX" >/dev/null || _die "Could not stop ${SANDBOX}; replacement was not started."
+  fi
+  docker rename "$SANDBOX" "$previous" \
+    || _die "Could not preserve ${SANDBOX} as ${previous}; replacement was not started."
+
+  if _create_container "$target_image" "$image_source" "$cpus" "$memory" "$pids" "$restart_policy" \
+    && docker start "$SANDBOX" >/dev/null \
+    && _wait_ready; then
+    docker container rm "$previous" >/dev/null \
+      || _warn "Replacement succeeded, but Docker could not remove ${previous}."
+    _restart_forwarders
+    _notice "Replaced ${SANDBOX}; its private home and project files were retained."
+    return 0
+  fi
+
+  _warn "The replacement did not become ready; restoring the previous sandbox."
+  if _resource_exists container "$SANDBOX"; then
+    docker container rm --force "$SANDBOX" >/dev/null 2>&1 || true
+  fi
+  if docker rename "$previous" "$SANDBOX"; then
+    restored=true
+    if [[ "$old_state" == "running" ]]; then
+      docker start "$SANDBOX" >/dev/null \
+        || _die "Replacement failed and the previous sandbox was renamed back, but it could not be restarted."
+      _wait_ready || _die "Replacement failed and the previous sandbox restarted but did not become ready."
+    fi
+  fi
+  if [[ "$restored" == true ]]; then
+    _die "Replacement failed; the previous sandbox was restored in its ${old_state} state."
+  fi
+  _die "Replacement failed and automatic rollback could not restore ${SANDBOX}; inspect ${previous} immediately."
+}
+
 _command_up() {
-  [[ $# -eq 0 ]] || _usage_error "up does not accept options in Milestone 2."
+  local requested_image="" cpus="" memory="" pids="" rebuild=false
+  local cpus_set=false memory_set=false pids_set=false image_set=false
+  local state source target_source target_image target_id current_image current_id restart_policy
+  local current_nano current_memory current_pids merged_cpus merged_memory merged_pids replacement=false
+  local idle_checked=false wanted_fingerprint current_fingerprint preview_target_id
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image)
+        [[ $# -ge 2 ]] || _usage_error "--image requires an image reference."
+        [[ "$image_set" == false ]] || _usage_error "--image may be specified only once."
+        requested_image="$2"; image_set=true; shift 2 ;;
+      --cpus)
+        [[ $# -ge 2 ]] || _usage_error "--cpus requires a value."
+        _validate_cpus "$2" --cpus
+        cpus="$2"; cpus_set=true; shift 2 ;;
+      --memory)
+        [[ $# -ge 2 ]] || _usage_error "--memory requires a value."
+        _validate_memory "$2" --memory
+        memory="$2"; memory_set=true; shift 2 ;;
+      --pids)
+        [[ $# -ge 2 ]] || _usage_error "--pids requires a value."
+        _validate_pids "$2" --pids
+        pids="$2"; pids_set=true; shift 2 ;;
+      --rebuild) rebuild=true; shift ;;
+      *) _usage_error "Unknown up option: $1" ;;
+    esac
+  done
+  if [[ "$image_set" == true && "$rebuild" == true ]]; then
+    _usage_error "--image and --rebuild cannot be used together."
+  fi
+
   _ensure_docker
   _acquire_lock
-  _ensure_sandbox_locked
-  _warn_if_stale
+  _assert_project_resources
+  state="$(_container_state)"
+  if [[ "$state" == "created" ]]; then
+    _notice "Replacing incomplete Created-state sandbox ${SANDBOX}..."
+    docker container rm "$SANDBOX" >/dev/null \
+      || _die "Could not remove incomplete sandbox ${SANDBOX}."
+    state="absent"
+  fi
+
+  if [[ "$state" == "absent" ]]; then
+    target_image="$IMAGE"
+    target_source=default
+    if [[ "$image_set" == true ]]; then
+      _validate_custom_image "$requested_image"
+      target_image="$requested_image"
+      target_source=custom
+    else
+      _ensure_image "$rebuild"
+    fi
+    _create_support_resources
+    merged_cpus="$CONFIG_CPUS"; merged_memory="$CONFIG_MEMORY"; merged_pids="$CONFIG_PIDS"
+    [[ "$cpus_set" == true ]] && merged_cpus="$cpus"
+    [[ "$memory_set" == true ]] && merged_memory="$memory"
+    [[ "$pids_set" == true ]] && merged_pids="$pids"
+    _notice "Creating sandbox ${SANDBOX}..."
+    _create_container "$target_image" "$target_source" "$merged_cpus" "$merged_memory" "$merged_pids" unless-stopped \
+      || _die "Could not create ${SANDBOX}. Check the bind path and Docker error above."
+    docker start "$SANDBOX" >/dev/null || _die "Could not start ${SANDBOX}."
+    _wait_ready || _die "Sandbox ${SANDBOX} did not become ready."
+    _restart_forwarders
+    _release_lock
+    _notice "Sandbox ${SANDBOX} is ready."
+    return 0
+  fi
+
+  case "$state" in
+    running|exited|dead) ;;
+    *) _die "Sandbox ${SANDBOX} is ${state}; resolve that Docker state and retry." ;;
+  esac
+
+  source="$(_resource_label container "$SANDBOX" 'aibox.image-source')"
+  [[ "$source" == "default" || "$source" == "custom" ]] \
+    || _die "Sandbox ${SANDBOX} has an invalid aibox.image-source label."
+  current_image="$(docker container inspect --format '{{.Config.Image}}' "$SANDBOX")"
+  current_id="$(docker container inspect --format '{{.Image}}' "$SANDBOX")"
+  restart_policy="$(docker container inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$SANDBOX")"
+  [[ -n "$restart_policy" && "$restart_policy" != "no" ]] || restart_policy=unless-stopped
+  current_nano="$(docker container inspect --format '{{.HostConfig.NanoCpus}}' "$SANDBOX")"
+  current_memory="$(docker container inspect --format '{{.HostConfig.Memory}}' "$SANDBOX")"
+  current_pids="$(docker container inspect --format '{{.HostConfig.PidsLimit}}' "$SANDBOX")"
+  [[ "$current_pids" =~ ^-?[0-9]+$ ]] || current_pids=0
+  (( current_pids < 0 )) && current_pids=0
+  merged_cpus="$(_cpus_from_nano "$current_nano")"
+  merged_memory="$current_memory"
+  merged_pids="$current_pids"
+  [[ "$cpus_set" == true ]] && merged_cpus="$cpus"
+  [[ "$memory_set" == true ]] && merged_memory="$memory"
+  [[ "$pids_set" == true ]] && merged_pids="$pids"
+
+  # Establish safety before a build, custom-image validation, or any other
+  # replace-class work. Image IDs are previewed read-only so a no-op custom
+  # image selection does not unnecessarily refuse an active sandbox.
+  if [[ "$image_set" == true ]]; then
+    preview_target_id="$(docker image inspect --format '{{.Id}}' "$requested_image" 2>/dev/null || true)"
+    if [[ -z "$preview_target_id" || "$preview_target_id" != "$current_id" || "$source" != "custom" ]]; then
+      replacement=true
+    fi
+  elif [[ "$source" == "default" ]]; then
+    _write_build_inputs
+    wanted_fingerprint="$(_build_fingerprint)"
+    current_fingerprint="$(_image_fingerprint)"
+    preview_target_id="$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
+    if [[ "$rebuild" == true || "$current_fingerprint" != "$wanted_fingerprint" || "$preview_target_id" != "$current_id" ]]; then
+      replacement=true
+    fi
+  elif [[ "$rebuild" == true ]]; then
+    _die "--rebuild does not replace a custom-image sandbox. Pass the desired image explicitly with --image."
+  fi
+  if [[ "$cpus_set" == true ]] && _is_zero_number "$cpus" && (( current_nano != 0 )); then
+    replacement=true
+  fi
+  if [[ "$memory_set" == true && "$memory" == "0" ]] && (( current_memory != 0 )); then
+    replacement=true
+  fi
+  if [[ "$replacement" == true ]]; then
+    _require_replacement_idle "$state"
+    idle_checked=true
+  fi
+
+  target_image="$current_image"
+  target_source="$source"
+  if [[ "$image_set" == true ]]; then
+    _validate_custom_image "$requested_image"
+    target_image="$requested_image"
+    target_source=custom
+  elif [[ "$source" == "default" ]]; then
+    _ensure_image "$rebuild"
+    target_image="$IMAGE"
+    target_source=default
+  fi
+  target_id="$(docker image inspect --format '{{.Id}}' "$target_image" 2>/dev/null || true)"
+  [[ -n "$target_id" ]] || _die "Target image '${target_image}' is not available."
+
+  [[ "$target_id" != "$current_id" || "$target_source" != "$source" || "$rebuild" == true ]] && replacement=true
+  if [[ "$cpus_set" == true ]] && _is_zero_number "$cpus" && (( current_nano != 0 )); then
+    replacement=true
+  fi
+  if [[ "$memory_set" == true && "$memory" == "0" ]] && (( current_memory != 0 )); then
+    replacement=true
+  fi
+
+  if [[ "$replacement" == true ]]; then
+    [[ "$idle_checked" == true ]] || _require_replacement_idle "$state"
+    _replace_container "$state" "$target_image" "$target_source" "$merged_cpus" "$merged_memory" "$merged_pids" "$restart_policy"
+  else
+    _apply_live_limits "$cpus_set" "$cpus" "$memory_set" "$memory" "$pids_set" "$pids"
+    if [[ "$state" != "running" ]]; then
+      docker start "$SANDBOX" >/dev/null || _die "Could not start ${SANDBOX}."
+      _wait_ready || _die "Sandbox ${SANDBOX} did not become ready."
+    fi
+    _restart_forwarders
+  fi
   _release_lock
   _notice "Sandbox ${SANDBOX} is ready."
 }
@@ -532,7 +931,7 @@ _command_run() {
   _ensure_docker
   _begin_session
   _acquire_lock
-  _ensure_sandbox_locked
+  _ensure_entry_sandbox_locked
   _warn_if_stale
   _release_lock
 
@@ -563,7 +962,7 @@ _command_shell() {
   _ensure_docker
   _begin_session
   _acquire_lock
-  _ensure_sandbox_locked
+  _ensure_entry_sandbox_locked
   _warn_if_stale
   _release_lock
 
@@ -590,6 +989,225 @@ _schema3_sandbox_ids() {
     --filter 'label=aibox.role=sandbox'
 }
 
+_volume_size() {
+  docker volume inspect --format '{{if .UsageData}}{{.UsageData.Size}} bytes{{else}}unavailable on this Docker runtime{{end}}' "$1" 2>/dev/null \
+    || printf 'unavailable\n'
+}
+
+_forwarder_ids() {
+  docker ps --all --quiet \
+    --filter "label=aibox.schema=${SCHEMA_VERSION}" \
+    --filter 'label=aibox.role=forward' \
+    --filter "label=aibox.path=${PROJECT_DIR}"
+}
+
+_forwarder_name() {
+  printf '%s-forward-%s\n' "$SANDBOX" "$1"
+}
+
+_valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+_parse_forward_spec() {
+  local spec="$1" host_port container_port
+  case "$spec" in
+    *:*) host_port="${spec%%:*}"; container_port="${spec#*:}" ;;
+    *) host_port="$spec"; container_port="$spec" ;;
+  esac
+  _valid_port "$host_port" && _valid_port "$container_port" \
+    || _usage_error "Invalid port-forward specification '${spec}'; use PORT or HOST_PORT:CONTAINER_PORT (1-65535)."
+  printf '%s:%s\n' "$((10#$host_port))" "$((10#$container_port))"
+}
+
+_ensure_forwarder() {
+  local host_port="$1" container_port="$2" name schema path role saved_host saved_port state
+  name="$(_forwarder_name "$host_port")"
+  if _resource_exists container "$name"; then
+    schema="$(_resource_label container "$name" 'aibox.schema')"
+    path="$(_resource_label container "$name" 'aibox.path')"
+    role="$(_resource_label container "$name" 'aibox.role')"
+    saved_host="$(_resource_label container "$name" 'aibox.forward.host')"
+    saved_port="$(_resource_label container "$name" 'aibox.forward.port')"
+    if [[ "$schema" != "$SCHEMA_VERSION" || "$path" != "$PROJECT_DIR" || "$role" != "forward" || "$saved_host" != "$host_port" ]]; then
+      _die "Refusing foreign container named ${name}; inspect or remove it manually."
+    fi
+    if [[ "$saved_port" != "$container_port" ]]; then
+      docker container rm --force "$name" >/dev/null \
+        || _die "Could not replace the existing forward on host port ${host_port}."
+    else
+      state="$(docker container inspect --format '{{.State.Status}}' "$name")"
+      if [[ "$state" != "running" ]]; then
+        docker start "$name" >/dev/null \
+          || _die "Could not bind 127.0.0.1:${host_port}; the host port may already be in use."
+      fi
+      _notice "Forward ready: 127.0.0.1:${host_port} -> ${SANDBOX}:${container_port}."
+      return 0
+    fi
+  fi
+
+  if ! docker image inspect "$FORWARD_IMAGE" >/dev/null 2>&1; then
+    _notice "Pulling forwarder image ${FORWARD_IMAGE}..."
+    docker pull "$FORWARD_IMAGE" >&2 \
+      || _die "Could not pull forwarder image ${FORWARD_IMAGE}."
+  fi
+  if ! docker run -d \
+    --name "$name" \
+    --network "$NETWORK" \
+    --restart unless-stopped \
+    --publish "127.0.0.1:${host_port}:${container_port}" \
+    --label "aibox.schema=${SCHEMA_VERSION}" \
+    --label "aibox.path=${PROJECT_DIR}" \
+    --label "aibox.slug=${SLUG}" \
+    --label "aibox.hash=${HASH}" \
+    --label "aibox.version=${CLI_VERSION}" \
+    --label 'aibox.role=forward' \
+    --label "aibox.forward.host=${host_port}" \
+    --label "aibox.forward.port=${container_port}" \
+    "$FORWARD_IMAGE" \
+    "TCP-LISTEN:${container_port},fork,reuseaddr" "TCP:${SANDBOX}:${container_port}" >/dev/null; then
+    if _resource_exists container "$name" \
+      && [[ "$(_resource_label container "$name" 'aibox.schema')" == "$SCHEMA_VERSION" ]] \
+      && [[ "$(_resource_label container "$name" 'aibox.path')" == "$PROJECT_DIR" ]]; then
+      docker container rm --force "$name" >/dev/null 2>&1 || true
+    fi
+    _die "Could not bind 127.0.0.1:${host_port}; the host port may already be in use."
+  fi
+  _notice "Forward ready: 127.0.0.1:${host_port} -> ${SANDBOX}:${container_port}. Ensure the server listens on 0.0.0.0, not only the container loopback."
+}
+
+_list_forwarders() {
+  local ids id host_port container_port state
+  ids="$(_forwarder_ids)"
+  if [[ -z "$ids" ]]; then
+    printf 'No port forwards for %s.\n' "$PROJECT_DIR"
+    return 0
+  fi
+  printf 'HOST\tCONTAINER\tSTATE\n'
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    host_port="$(_resource_label container "$id" 'aibox.forward.host')"
+    container_port="$(_resource_label container "$id" 'aibox.forward.port')"
+    state="$(docker container inspect --format '{{.State.Status}}' "$id")"
+    printf '127.0.0.1:%s\t%s:%s\t%s\n' "$host_port" "$SANDBOX" "$container_port" "$state"
+  done <<EOF
+$ids
+EOF
+}
+
+_remove_forwarders() {
+  local host_port="${1:-}" ids
+  if [[ -n "$host_port" ]]; then
+    ids="$(docker ps --all --quiet \
+      --filter "label=aibox.schema=${SCHEMA_VERSION}" \
+      --filter 'label=aibox.role=forward' \
+      --filter "label=aibox.path=${PROJECT_DIR}" \
+      --filter "label=aibox.forward.host=${host_port}")"
+  else
+    ids="$(_forwarder_ids)"
+  fi
+  if [[ -n "$ids" ]]; then
+    # shellcheck disable=SC2086
+    docker container rm --force $ids >/dev/null
+  fi
+}
+
+_command_port_forward() {
+  local mode=create target="" pairs="" parsed host_port container_port
+  if [[ "${1:-}" == "--list" ]]; then
+    mode=list; shift
+  elif [[ "${1:-}" == "--stop-all" ]]; then
+    mode=stop-all; shift
+  elif [[ "${1:-}" == "--stop" ]]; then
+    [[ $# -ge 2 ]] || _usage_error "port-forward --stop requires a host port."
+    mode=stop; target="$2"; shift 2
+    _valid_port "$target" || _usage_error "Invalid host port '${target}'."
+    target="$((10#$target))"
+  else
+    [[ $# -gt 0 ]] || _usage_error "port-forward requires a port specification or management option."
+    while [[ $# -gt 0 ]]; do
+      parsed="$(_parse_forward_spec "$1")"
+      pairs="${pairs}${parsed} "
+      shift
+    done
+  fi
+  [[ $# -eq 0 ]] || _usage_error "Unexpected port-forward arguments."
+
+  _ensure_docker
+  _acquire_lock
+  _assert_project_resources
+  case "$mode" in
+    list)
+      _list_forwarders
+      ;;
+    stop)
+      _remove_forwarders "$target"
+      _notice "Removed the forward on 127.0.0.1:${target}, if it existed."
+      ;;
+    stop-all)
+      _remove_forwarders
+      _notice "Removed all port forwards for ${PROJECT_DIR}."
+      ;;
+    create)
+      _ensure_entry_sandbox_locked
+      # Parsed values are numeric and contain no spaces.
+      # shellcheck disable=SC2086
+      for parsed in $pairs; do
+        host_port="${parsed%%:*}"
+        container_port="${parsed#*:}"
+        _ensure_forwarder "$host_port" "$container_port"
+      done
+      ;;
+  esac
+  _release_lock
+}
+
+_command_remove() {
+  local purge=false yes=false ids answer
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --purge) purge=true ;;
+      --yes) yes=true ;;
+      *) _usage_error "Unknown remove option: $1" ;;
+    esac
+    shift
+  done
+  [[ "$yes" == false || "$purge" == true ]] || _usage_error "--yes is valid only with --purge."
+  _ensure_docker
+  _acquire_lock
+  _assert_project_resources
+  if [[ "$purge" == true && "$yes" == false ]]; then
+    printf 'Delete sandbox and private home volume %s? [y/N] ' "$HOME_VOLUME" >&2
+    read -r answer || answer=""
+    case "$answer" in y|Y|yes|YES) ;; *) _notice "Cancelled; nothing was removed."; _release_lock; return 0 ;; esac
+  fi
+
+  ids="$(_forwarder_ids)"
+  if [[ -n "$ids" ]]; then
+    # shellcheck disable=SC2086
+    docker container rm --force $ids >/dev/null
+  fi
+  if _resource_exists container "$SANDBOX"; then
+    docker container rm --force "$SANDBOX" >/dev/null \
+      || _die "Could not remove sandbox ${SANDBOX}."
+  fi
+  if _resource_exists network "$NETWORK"; then
+    docker network rm "$NETWORK" >/dev/null \
+      || _die "Could not remove network ${NETWORK}."
+  fi
+  if [[ "$purge" == true ]]; then
+    if _resource_exists volume "$HOME_VOLUME"; then
+      docker volume rm "$HOME_VOLUME" >/dev/null \
+        || _die "Could not delete private home volume ${HOME_VOLUME}."
+    fi
+    _notice "Removed ${SANDBOX}, its network and forwards, and deleted private home volume ${HOME_VOLUME}."
+  else
+    _notice "Removed ${SANDBOX}, its network and forwards. Private home volume ${HOME_VOLUME} was retained."
+    _notice "Delete it explicitly with: aibox --dir '${PROJECT_DIR}' remove --purge --yes"
+  fi
+  _release_lock
+}
+
 _command_stop() {
   local all=false ids forward_ids
   if [[ "${1:-}" == "--all" ]]; then
@@ -611,12 +1229,12 @@ _command_stop() {
 
   _acquire_lock
   _assert_project_resources
+  forward_ids="$(_forwarder_ids)"
+  if [[ -n "$forward_ids" ]]; then
+    # shellcheck disable=SC2086
+    docker stop $forward_ids >/dev/null
+  fi
   if _resource_exists container "$SANDBOX"; then
-    forward_ids="$(docker ps --all --quiet --filter "label=aibox.schema=${SCHEMA_VERSION}" --filter 'label=aibox.role=forward' --filter "label=aibox.path=${PROJECT_DIR}")"
-    if [[ -n "$forward_ids" ]]; then
-      # shellcheck disable=SC2086
-      docker stop $forward_ids >/dev/null
-    fi
     docker stop "$SANDBOX" >/dev/null
     _notice "Stopped ${SANDBOX}. Its private home volume was retained."
   else
@@ -627,7 +1245,7 @@ _command_stop() {
 
 _status_one() {
   local name="$1" path="$2" state image activity sessions stats size_rw pids memory nano_cpus
-  local container_image_id current_image_id stale forward_count
+  local container_image_id current_image_id stale forward_count home_size
   SANDBOX="$name"
   state="$(docker container inspect --format '{{.State.Status}}' "$name")"
   image="$(docker container inspect --format '{{.Config.Image}}' "$name")"
@@ -641,7 +1259,8 @@ _status_one() {
       stale="yes"
     fi
   fi
-  printf 'Image stale: %s\nPrivate home: %s\nNetwork: %s\n' "$stale" "$name" "$name"
+  home_size="$(_volume_size "$name")"
+  printf 'Image stale: %s\nPrivate home: %s (%s)\nNetwork: %s\n' "$stale" "$name" "$home_size" "$name"
   pids="$(docker container inspect --format '{{.HostConfig.PidsLimit}}' "$name")"
   memory="$(docker container inspect --format '{{.HostConfig.Memory}}' "$name")"
   nano_cpus="$(docker container inspect --format '{{.HostConfig.NanoCpus}}' "$name")"
@@ -712,7 +1331,7 @@ _main() {
   done
 
   case "$command" in
-    ""|up|run|shell|stop|status) _load_config ;;
+    ""|up|run|shell|stop|status|remove|port-forward) _load_config ;;
   esac
 
   if [[ -n "$selected_dir" ]]; then
@@ -739,6 +1358,8 @@ _main() {
     shell) _command_shell "$@" ;;
     stop) _command_stop "$@" ;;
     status) _command_status "$@" ;;
+    remove) _command_remove "$@" ;;
+    port-forward) _command_port_forward "$@" ;;
     version)
       [[ $# -eq 0 ]] || _usage_error "version does not accept arguments."
       printf 'aibox %s (schema %s)\n' "$CLI_VERSION" "$SCHEMA_VERSION"
