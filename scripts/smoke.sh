@@ -21,6 +21,9 @@ SMOKE_ID=""
 M3_VALID_IMAGE=""
 M3_BAD_USER_IMAGE=""
 M3_BAD_ENTRY_IMAGE=""
+M3_BAD_UID_IMAGE=""
+M3_BAD_HOME_IMAGE=""
+M3_NO_SLEEP_IMAGE=""
 M3_ROLLBACK_IMAGE=""
 CHECKS=0
 FAILURES=0
@@ -149,7 +152,7 @@ cleanup() {
   if [[ -n "$IMAGE_LIST" && -f "$IMAGE_LIST" ]] && docker_ready; then
     while IFS= read -r image_tag; do
       case "$image_tag" in
-        aibox-smoke-*:*) "$REAL_DOCKER" image rm "$image_tag" >/dev/null 2>&1 || true ;;
+        aibox-smoke-*:*|aibox:smoke-*-node24) "$REAL_DOCKER" image rm "$image_tag" >/dev/null 2>&1 || true ;;
       esac
     done < "$IMAGE_LIST"
   fi
@@ -221,6 +224,9 @@ build_m3_images() {
   M3_INDEPENDENT_IMAGE="aibox-smoke-${SMOKE_ID}:independent"
   M3_BAD_USER_IMAGE="aibox-smoke-${SMOKE_ID}:bad-user"
   M3_BAD_ENTRY_IMAGE="aibox-smoke-${SMOKE_ID}:bad-entry"
+  M3_BAD_UID_IMAGE="aibox-smoke-${SMOKE_ID}:bad-uid"
+  M3_BAD_HOME_IMAGE="aibox-smoke-${SMOKE_ID}:bad-home"
+  M3_NO_SLEEP_IMAGE="aibox-smoke-${SMOKE_ID}:no-sleep"
   M3_ROLLBACK_IMAGE="aibox-smoke-${SMOKE_ID}:rollback"
   mkdir -p "$build_dir"
 
@@ -248,17 +254,38 @@ DOCKERFILE
 FROM ${SMOKE_IMAGE}
 ENTRYPOINT ["sh", "-c", "if [ \"\$PWD\" = \"/home/aibox\" ]; then exec \"\$@\"; else exit 42; fi", "aibox-entry"]
 DOCKERFILE
+  cat > "${build_dir}/Dockerfile.bad-uid" <<DOCKERFILE
+FROM ${SMOKE_IMAGE}
+USER root
+RUN usermod -u 1001 aibox
+USER aibox
+DOCKERFILE
+  cat > "${build_dir}/Dockerfile.bad-home" <<DOCKERFILE
+FROM ${SMOKE_IMAGE}
+ENV HOME=/wrong-home
+DOCKERFILE
+  cat > "${build_dir}/Dockerfile.no-sleep" <<DOCKERFILE
+FROM ${SMOKE_IMAGE}
+USER root
+RUN rm -f /usr/bin/sleep /bin/sleep
+USER aibox
+DOCKERFILE
+
+  # Record before building so partial fixture-build failures also clean up.
+  local fixture_image
+  for fixture_image in "$M3_VALID_IMAGE" "$M3_INDEPENDENT_IMAGE" "$M3_BAD_USER_IMAGE" \
+    "$M3_BAD_ENTRY_IMAGE" "$M3_ROLLBACK_IMAGE" "$M3_BAD_UID_IMAGE" "$M3_BAD_HOME_IMAGE" "$M3_NO_SLEEP_IMAGE"; do
+    record_image "$fixture_image"
+  done
 
   if "$REAL_DOCKER" build -q -f "${build_dir}/Dockerfile.valid" -t "$M3_VALID_IMAGE" "$build_dir" >/dev/null \
     && "$REAL_DOCKER" build -q -f "${build_dir}/Dockerfile.independent" -t "$M3_INDEPENDENT_IMAGE" "$build_dir" >/dev/null \
     && "$REAL_DOCKER" build -q -f "${build_dir}/Dockerfile.bad-user" -t "$M3_BAD_USER_IMAGE" "$build_dir" >/dev/null \
     && "$REAL_DOCKER" build -q -f "${build_dir}/Dockerfile.bad-entry" -t "$M3_BAD_ENTRY_IMAGE" "$build_dir" >/dev/null \
-    && "$REAL_DOCKER" build -q -f "${build_dir}/Dockerfile.rollback" -t "$M3_ROLLBACK_IMAGE" "$build_dir" >/dev/null; then
-    record_image "$M3_VALID_IMAGE"
-    record_image "$M3_INDEPENDENT_IMAGE"
-    record_image "$M3_BAD_USER_IMAGE"
-    record_image "$M3_BAD_ENTRY_IMAGE"
-    record_image "$M3_ROLLBACK_IMAGE"
+    && "$REAL_DOCKER" build -q -f "${build_dir}/Dockerfile.rollback" -t "$M3_ROLLBACK_IMAGE" "$build_dir" >/dev/null \
+    && "$REAL_DOCKER" build -q -f "${build_dir}/Dockerfile.bad-uid" -t "$M3_BAD_UID_IMAGE" "$build_dir" >/dev/null \
+    && "$REAL_DOCKER" build -q -f "${build_dir}/Dockerfile.bad-home" -t "$M3_BAD_HOME_IMAGE" "$build_dir" >/dev/null \
+    && "$REAL_DOCKER" build -q -f "${build_dir}/Dockerfile.no-sleep" -t "$M3_NO_SLEEP_IMAGE" "$build_dir" >/dev/null; then
     pass "Milestone 3 image fixtures build"
   else
     fail "Milestone 3 image fixtures build"
@@ -650,11 +677,26 @@ EOF
 }
 
 test_custom_images_and_rollback() {
-  local project="$1" name="$2" out err code before after state source
+  local project="$1" name="$2" out err code before after state source invalid_image
   out="${HARNESS_DIR}/images.out"
   err="${HARNESS_DIR}/images.err"
   run_aibox --dir "$project" up >"$out" 2>"$err" || { fail "create custom-image sandbox"; return; }
   before="$("$REAL_DOCKER" container inspect --format '{{.Id}}' "$name")"
+
+  for invalid_image in "$M3_BAD_UID_IMAGE" "$M3_BAD_HOME_IMAGE" "$M3_NO_SLEEP_IMAGE"; do
+    set +e
+    run_aibox --dir "$project" up --image "$invalid_image" >"$out" 2>"$err"
+    code=$?
+    set -e
+    after="$("$REAL_DOCKER" container inspect --format '{{.Id}}' "$name")"
+    state="$("$REAL_DOCKER" container inspect --format '{{.State.Status}}' "$name")"
+    if [[ "$code" -eq 1 && "$after" == "$before" && "$state" == running ]] \
+      && grep -Fq 'require UID 1000, HOME=/home/aibox, sleep' "$err"; then
+      pass "failed runtime contract check refuses image ${invalid_image##*:} before replacement"
+    else
+      fail "runtime contract check for ${invalid_image##*:} (exit=${code}, state=${state})"
+    fi
+  done
 
   set +e
   run_aibox --dir "$project" up --image "$M3_BAD_USER_IMAGE" >"$out" 2>"$err"
@@ -722,6 +764,164 @@ test_custom_images_and_rollback() {
 
 _docker_label() {
   "$REAL_DOCKER" container inspect --format "{{ index .Config.Labels \"$2\" }}" "$1"
+}
+
+test_endpoint_precedence() {
+  local project="$1" out="${HARNESS_DIR}/endpoint.out" err="${HARNESS_DIR}/endpoint.err" code local_context
+  set +e
+  DOCKER_HOST=unix:///unused-local-smoke.sock DOCKER_CONTEXT=smoke-remote \
+    AIBOX_SMOKE_REAL_DOCKER="$REAL_DOCKER" \
+    AIBOX_SMOKE_DOCKER_ENDPOINT=ssh://remote.example \
+    AIBOX_CONFIG_DIR="$SMOKE_CONFIG" AIBOX_CLI_VERSION="$SMOKE_VERSION" \
+    PATH="${STUB_DIR}:${PATH}" "$AIBOX_BIN" --dir "$project" status >"$out" 2>"$err"
+  code=$?
+  set -e
+  if [[ "$code" -eq 1 ]] && grep -Fq 'Refusing remote Docker endpoint ssh://remote.example' "$err"; then
+    pass "remote DOCKER_CONTEXT overrides local DOCKER_HOST and is refused"
+  else
+    fail "remote context precedence (exit=${code})"
+  fi
+
+  local_context="$("$REAL_DOCKER" context show)"
+  if DOCKER_HOST=ssh://unused-remote.example DOCKER_CONTEXT="$local_context" \
+    run_aibox --dir "$project" status >"$out" 2>"$err"; then
+    pass "local DOCKER_CONTEXT overrides remote DOCKER_HOST and remains usable"
+  else
+    fail "local context precedence"
+  fi
+}
+
+test_replacement_interruptions() {
+  local project="$1" name="$2" out="${HARNESS_DIR}/interrupt.out" err="${HARNESS_DIR}/interrupt.err"
+  local before after state code signal stage expected_state scenario
+  run_aibox --dir "$project" up >"$out" 2>"$err" || { fail "create interruption fixture"; return; }
+  before="$("$REAL_DOCKER" container inspect --format '{{.Id}}' "$name")"
+  set +e
+  AIBOX_SMOKE_REAL_DOCKER="$REAL_DOCKER" AIBOX_SMOKE_FAIL_COMMAND=rename \
+    AIBOX_CONFIG_DIR="$SMOKE_CONFIG" AIBOX_CLI_VERSION="$SMOKE_VERSION" \
+    PATH="${STUB_DIR}:${PATH}" "$AIBOX_BIN" --dir "$project" up --image "$M3_VALID_IMAGE" >"$out" 2>"$err"
+  code=$?
+  set -e
+  after="$("$REAL_DOCKER" container inspect --format '{{.Id}}' "$name")"
+  state="$("$REAL_DOCKER" container inspect --format '{{.State.Status}}' "$name")"
+  if [[ "$code" -eq 1 && "$after" == "$before" && "$state" == running ]]; then
+    pass "rename failure restores the original running container"
+  else
+    fail "rename failure recovery (exit=${code}, state=${state})"
+  fi
+
+  for scenario in TERM:before-create:running INT:after-start:running HUP:before-create:exited TERM:after-start:exited; do
+    signal="${scenario%%:*}"; stage="${scenario#*:}"; stage="${stage%%:*}"
+    expected_state="${scenario##*:}"
+    if [[ "$expected_state" == exited ]]; then
+      run_aibox --dir "$project" stop >/dev/null 2>>"$err"
+    fi
+    set +e
+    AIBOX_SMOKE_REAL_DOCKER="$REAL_DOCKER" AIBOX_SMOKE_INTERRUPT_SANDBOX="$name" \
+      AIBOX_SMOKE_INTERRUPT_SIGNAL="$signal" AIBOX_SMOKE_INTERRUPT_STAGE="$stage" \
+      AIBOX_CONFIG_DIR="$SMOKE_CONFIG" AIBOX_CLI_VERSION="$SMOKE_VERSION" \
+      PATH="${STUB_DIR}:${PATH}" "$AIBOX_BIN" --dir "$project" up --image "$M3_VALID_IMAGE" >"$out" 2>"$err"
+    code=$?
+    set -e
+    after="$("$REAL_DOCKER" container inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
+    state="$("$REAL_DOCKER" container inspect --format '{{.State.Status}}' "$name" 2>/dev/null || true)"
+    if [[ "$code" -eq 130 && "$after" == "$before" && "$state" == "$expected_state" ]] \
+      && ! "$REAL_DOCKER" container inspect "${name}.prev" >/dev/null 2>&1; then
+      pass "${signal} ${stage} restores original ${expected_state} container"
+    else
+      fail "interrupted replacement ${scenario} (exit=${code}, state=${state})"
+      return
+    fi
+  done
+
+  # SIGKILL cannot run a trap. The next invocation must preserve .prev and
+  # refuse to create a fresh default sandbox under the missing canonical name.
+  set +e
+  AIBOX_SMOKE_REAL_DOCKER="$REAL_DOCKER" AIBOX_SMOKE_INTERRUPT_SANDBOX="$name" \
+    AIBOX_SMOKE_INTERRUPT_SIGNAL=KILL AIBOX_CONFIG_DIR="$SMOKE_CONFIG" AIBOX_CLI_VERSION="$SMOKE_VERSION" \
+    PATH="${STUB_DIR}:${PATH}" "$AIBOX_BIN" --dir "$project" up --image "$M3_VALID_IMAGE" >"$out" 2>"$err"
+  code=$?
+  run_aibox --dir "$project" run true >>"$out" 2>>"$err"
+  local retry_code=$?
+  set -e
+  after="$("$REAL_DOCKER" container inspect --format '{{.Id}}' "${name}.prev" 2>/dev/null || true)"
+  if [[ "$code" -eq 137 && "$retry_code" -eq 1 && "$after" == "$before" ]] \
+    && grep -Fq 'Recovery container' "$err" \
+    && ! "$REAL_DOCKER" container inspect "$name" >/dev/null 2>&1; then
+    pass "uncatchable interruption leaves original intact and next run refuses fresh creation"
+  else
+    fail "uncatchable interruption recovery guard (exit=${code}, retry=${retry_code})"
+  fi
+  # Leave the synthetic original usable; the ordinary harness cleanup owns it.
+  "$REAL_DOCKER" rename "${name}.prev" "$name"
+}
+
+test_parallel_build_contexts() {
+  local project_a="$1" project_b="$2" barrier="${HARNESS_DIR}/build-barrier"
+  local first_pid second_pid first_code second_code contexts context first_context="" second_context="" attempts=0
+  local first_tag="aibox:${SMOKE_VERSION}-first-node24" second_tag="aibox:${SMOKE_VERSION}-second-node24"
+  mkdir -p "$barrier"
+  record_image "$first_tag"; record_image "$second_tag"
+  printf 'LABEL aibox.smoke.generation=first\n' > "${SMOKE_CONFIG}/Dockerfile.extra"
+  AIBOX_SMOKE_REAL_DOCKER="$REAL_DOCKER" AIBOX_SMOKE_BUILD_BARRIER="$barrier" \
+    AIBOX_CONFIG_DIR="$SMOKE_CONFIG" AIBOX_CLI_VERSION="${SMOKE_VERSION}-first" \
+    PATH="${STUB_DIR}:${PATH}" "$AIBOX_BIN" --dir "$project_a" up >"${barrier}/first.out" 2>"${barrier}/first.err" & first_pid=$!
+  printf '%s\n' "$first_pid" >> "$HOST_PID_LIST"
+  while ! compgen -G "${barrier}/*.context" >/dev/null; do
+    attempts=$((attempts + 1))
+    if (( attempts >= 300 )); then
+      fail "first build reached context barrier"; touch "${barrier}/release"
+      wait "$first_pid" || true
+      return
+    fi
+    sleep 0.1
+  done
+  printf 'LABEL aibox.smoke.generation=second\n' > "${SMOKE_CONFIG}/Dockerfile.extra"
+  AIBOX_SMOKE_REAL_DOCKER="$REAL_DOCKER" AIBOX_SMOKE_BUILD_BARRIER="$barrier" \
+    AIBOX_CONFIG_DIR="$SMOKE_CONFIG" AIBOX_CLI_VERSION="${SMOKE_VERSION}-second" \
+    PATH="${STUB_DIR}:${PATH}" "$AIBOX_BIN" --dir "$project_b" up >"${barrier}/second.out" 2>"${barrier}/second.err" & second_pid=$!
+  printf '%s\n' "$second_pid" >> "$HOST_PID_LIST"
+  attempts=0
+  while :; do
+    contexts=("${barrier}"/*.context)
+    (( ${#contexts[@]} == 2 )) && break
+    attempts=$((attempts + 1))
+    if (( attempts >= 300 )); then
+      fail "second build reached context barrier"; touch "${barrier}/release"
+      wait "$first_pid" || true
+      wait "$second_pid" || true
+      return
+    fi
+    sleep 0.1
+  done
+  for context in "${contexts[@]}"; do
+    context="$(cat "$context")"
+    if grep -Fq 'generation=first' "${context}/Dockerfile"; then first_context="$context"; fi
+    if grep -Fq 'generation=second' "${context}/Dockerfile"; then second_context="$context"; fi
+  done
+  if [[ -n "$first_context" && -n "$second_context" && "$first_context" != "$second_context" ]]; then
+    pass "parallel project builds preserve independent input snapshots"
+  else
+    fail "parallel project build contexts collided"
+  fi
+  touch "${barrier}/release"
+  set +e
+  wait "$first_pid"; first_code=$?
+  wait "$second_pid"; second_code=$?
+  set -e
+  if [[ "$first_code" -eq 0 && "$second_code" -eq 0 ]] \
+    && [[ "$("$REAL_DOCKER" image inspect --format '{{index .Config.Labels "aibox.smoke.generation"}}' "$first_tag")" == first ]] \
+    && [[ "$("$REAL_DOCKER" image inspect --format '{{index .Config.Labels "aibox.smoke.generation"}}' "$second_tag")" == second ]]; then
+    pass "both concurrent builds use their own captured Dockerfile"
+  else
+    fail "parallel project builds (first=${first_code}, second=${second_code})"
+  fi
+  if [[ ! -d "$first_context" && ! -d "$second_context" ]]; then
+    pass "private build contexts are cleaned after success"
+  else
+    fail "private build context cleanup"
+  fi
+  rm -f "${SMOKE_CONFIG}/Dockerfile.extra"
 }
 
 test_concurrent_run_and_up() {
@@ -983,6 +1183,7 @@ main() {
   local project_one project_two project_foreign name_one name_foreign
   local project_limits project_images project_race project_fingerprint project_forward project_other project_network
   local name_limits name_images name_race name_fingerprint name_forward name_other
+  local project_interrupt name_interrupt project_build_a project_build_b
   setup
   trap cleanup EXIT
   trap on_signal HUP INT TERM
@@ -997,6 +1198,7 @@ main() {
   test_reuse_mounts_and_persistence "$project_one" "$name_one"
   test_concurrent_creation "$project_two"
   test_refusals_and_fail_closed "$project_one" "$name_one" "$project_foreign" "$name_foreign"
+  test_endpoint_precedence "$project_one"
 
   build_m3_images || {
     printf 'Smoke harness complete: %s checks, %s failures\n' "$CHECKS" "$FAILURES"
@@ -1009,12 +1211,16 @@ main() {
   project_forward="$(new_project)"; name_forward="$(project_name "$project_forward")"
   project_other="$(new_project)"; name_other="$(project_name "$project_other")"
   project_network="$(new_project)"
+  project_interrupt="$(new_project)"; name_interrupt="$(project_name "$project_interrupt")"
+  project_build_a="$(new_project)"; project_build_b="$(new_project)"
 
   test_limits_and_active_refusal "$project_limits" "$name_limits"
   test_custom_images_and_rollback "$project_images" "$name_images"
+  test_replacement_interruptions "$project_interrupt" "$name_interrupt"
   test_concurrent_run_and_up "$project_race" "$name_race"
   test_forwarding_and_remove "$project_forward" "$name_forward" "$project_other" "$name_other"
   test_address_pool_failure "$project_network"
+  test_parallel_build_contexts "$project_build_a" "$project_build_b"
   test_fingerprint_rebuild "$project_fingerprint" "$name_fingerprint"
 
   printf 'Smoke harness complete: %s checks, %s failures\n' "$CHECKS" "$FAILURES"

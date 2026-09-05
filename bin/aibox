@@ -24,6 +24,10 @@ NETWORK=""
 LOCK_PATH=""
 SESSION_MARKER=""
 VALIDATION_CONTAINER=""
+BUILD_DIR=""
+REPLACEMENT_ID=""
+REPLACEMENT_STATE=""
+LOCAL_DOCKER_ENDPOINT=""
 CONFIG_CPUS="0"
 CONFIG_MEMORY="0"
 CONFIG_PIDS="$DEFAULT_PIDS"
@@ -172,21 +176,34 @@ _set_project() {
   LOCK_PATH="${CONFIG_DIR}/locks/${SANDBOX}"
 }
 
-_docker_endpoint() {
-  if [[ -n "${DOCKER_HOST:-}" ]]; then
-    printf '%s\n' "$DOCKER_HOST"
-    return 0
+docker() {
+  # Pin every operation to the endpoint that passed the local-only check.
+  # Keep the caller's environment intact for explicit run --env forwarding.
+  if [[ -n "$LOCAL_DOCKER_ENDPOINT" ]]; then
+    command docker --host "$LOCAL_DOCKER_ENDPOINT" "$@"
+  else
+    command docker "$@"
   fi
-  docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null | head -1
+}
+
+_docker_endpoint() {
+  # Match Docker's precedence: an explicit context overrides DOCKER_HOST.
+  if [[ -n "${DOCKER_CONTEXT:-}" ]]; then
+    docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null
+  elif [[ -n "${DOCKER_HOST:-}" ]]; then
+    printf '%s\n' "$DOCKER_HOST"
+  else
+    docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null
+  fi
 }
 
 _require_local_docker() {
   local endpoint
-  command -v docker >/dev/null 2>&1 \
+  type -P docker >/dev/null 2>&1 \
     || _die "Docker CLI not found. Install Docker, Colima, or OrbStack and retry."
   endpoint="$(_docker_endpoint)" || _die "Could not inspect the active Docker context."
   case "$endpoint" in
-    unix://*) ;;
+    unix://*) LOCAL_DOCKER_ENDPOINT="$endpoint" ;;
     *) _die "Refusing remote Docker endpoint ${endpoint:-unknown}. AI Box requires a local Unix socket because project bind paths belong to the daemon host." ;;
   esac
 }
@@ -247,6 +264,9 @@ _assert_owned_resource() {
 }
 
 _assert_project_resources() {
+  if _resource_exists container "${SANDBOX}.prev"; then
+    _die "Recovery container ${SANDBOX}.prev exists. Inspect and restore or retire it manually before continuing; no sandbox was created or removed."
+  fi
   _assert_owned_resource container "$SANDBOX"
   _assert_owned_resource volume "$HOME_VOLUME"
   _assert_owned_resource network "$NETWORK"
@@ -297,11 +317,19 @@ _acquire_lock() {
 
 _cleanup() {
   AIBOX_EXIT_STATUS=$?
-  trap - EXIT HUP INT TERM
+  trap - EXIT
+  # Finish recovery under the mutex even if another catchable signal arrives.
+  trap '' HUP INT TERM
+  if [[ -n "$REPLACEMENT_ID" ]]; then
+    _rollback_replacement || AIBOX_EXIT_STATUS=1
+  fi
   _release_lock
   [[ -n "$SESSION_MARKER" ]] && rm -f -- "$SESSION_MARKER" 2>/dev/null || true
   if [[ -n "$VALIDATION_CONTAINER" ]]; then
     docker container rm --force "$VALIDATION_CONTAINER" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$BUILD_DIR" ]]; then
+    rm -rf -- "$BUILD_DIR"
   fi
   exit "$AIBOX_EXIT_STATUS"
 }
@@ -327,8 +355,13 @@ _active_session_count() {
 }
 
 _write_build_inputs() {
+  # Snapshot once per invocation. Other project mutexes do not protect these
+  # inputs, so no fingerprint or build may read shared generated files.
+  [[ -n "$BUILD_DIR" ]] && return 0
   mkdir -p "$CONFIG_DIR"
-  cat > "${CONFIG_DIR}/Dockerfile" <<DOCKERFILE
+  BUILD_DIR="$(mktemp -d "${CONFIG_DIR}/build.XXXXXX")" \
+    || _die "Could not create a private image build directory."
+  cat > "${BUILD_DIR}/Dockerfile" <<DOCKERFILE
 FROM node:${NODE_VERSION}-bookworm
 
 RUN apt-get update \\
@@ -352,11 +385,11 @@ CMD ["sleep", "infinity"]
 DOCKERFILE
 
   if [[ -f "${CONFIG_DIR}/Dockerfile.extra" ]]; then
-    printf '\n' >> "${CONFIG_DIR}/Dockerfile"
-    cat "${CONFIG_DIR}/Dockerfile.extra" >> "${CONFIG_DIR}/Dockerfile"
+    printf '\n' >> "${BUILD_DIR}/Dockerfile"
+    cat "${CONFIG_DIR}/Dockerfile.extra" >> "${BUILD_DIR}/Dockerfile"
   fi
 
-  cat > "${CONFIG_DIR}/entrypoint.sh" <<'ENTRYPOINT'
+  cat > "${BUILD_DIR}/entrypoint.sh" <<'ENTRYPOINT'
 #!/usr/bin/env bash
 set -e
 rm -f /tmp/aibox-ready
@@ -367,12 +400,12 @@ fi
 touch /tmp/aibox-ready
 exec "$@"
 ENTRYPOINT
-  chmod 0755 "${CONFIG_DIR}/entrypoint.sh"
-  printf '*\n!Dockerfile\n!entrypoint.sh\n' > "${CONFIG_DIR}/.dockerignore"
+  chmod 0755 "${BUILD_DIR}/entrypoint.sh"
+  printf '*\n!Dockerfile\n!entrypoint.sh\n' > "${BUILD_DIR}/.dockerignore"
 }
 
 _build_fingerprint() {
-  { cat "${CONFIG_DIR}/Dockerfile"; cat "${CONFIG_DIR}/entrypoint.sh"; } | _sha256
+  { cat "${BUILD_DIR}/Dockerfile"; cat "${BUILD_DIR}/entrypoint.sh"; } | _sha256
 }
 
 _check_disk_space() {
@@ -396,7 +429,7 @@ _build_default_image() {
   wanted="$(_build_fingerprint)"
   _check_disk_space
   _notice "Building ${IMAGE}; this may take a few minutes..."
-  docker build --pull --label "aibox.build-fingerprint=${wanted}" -t "$IMAGE" "$CONFIG_DIR" >&2 \
+  docker build --pull --label "aibox.build-fingerprint=${wanted}" -t "$IMAGE" "$BUILD_DIR" >&2 \
     || _die "Failed to build ${IMAGE}. Review the Docker output above and retry."
   _notice "Built ${IMAGE}."
 }
@@ -426,9 +459,9 @@ _validate_custom_image() {
 
   VALIDATION_CONTAINER="aibox-validate-$$-${RANDOM}"
   if ! docker create --name "$VALIDATION_CONTAINER" "$image" sh -c '
-    test "$(id -u)" = 1000
-    test "$HOME" = /home/aibox
-    command -v sleep >/dev/null
+    test "$(id -u)" = 1000 &&
+    test "$HOME" = /home/aibox &&
+    command -v sleep >/dev/null &&
     printf aibox-validation-ok
   ' >/dev/null; then
     docker container rm --force "$VALIDATION_CONTAINER" >/dev/null 2>&1 || true
@@ -702,23 +735,64 @@ $ids
 EOF
 }
 
+_rollback_replacement() {
+  local original_id="$REPLACEMENT_ID" old_state="$REPLACEMENT_STATE" original_name candidate_id
+  # Do not recursively retry if recovery itself fails. Preserve the original
+  # by ID and leave a diagnostic for manual recovery if Docker is unavailable.
+  REPLACEMENT_ID=""
+  original_name="$(docker container inspect --format '{{.Name}}' "$original_id")" || {
+    _warn "Could not inspect original container ${original_id}; inspect ${SANDBOX}.prev before continuing."
+    return 1
+  }
+  if [[ "$original_name" == "/${SANDBOX}.prev" ]]; then
+    if _resource_exists container "$SANDBOX"; then
+      candidate_id="$(docker container inspect --format '{{.Id}}' "$SANDBOX")" || return 1
+      if [[ "$(_resource_label container "$candidate_id" 'aibox.schema')" != "$SCHEMA_VERSION" \
+        || "$(_resource_label container "$candidate_id" 'aibox.path')" != "$PROJECT_DIR" \
+        || "$(_resource_label container "$candidate_id" 'aibox.role')" != sandbox ]]; then
+        _warn "Rollback refused to remove an unrecognized container at ${SANDBOX}; original retained as ${SANDBOX}.prev."
+        return 1
+      fi
+      docker container rm --force "$candidate_id" >/dev/null || return 1
+    fi
+    docker rename "$original_id" "$SANDBOX" || return 1
+  elif [[ "$original_name" != "/${SANDBOX}" ]]; then
+    _warn "Original container ${original_id} has unexpected name ${original_name}; inspect it manually."
+    return 1
+  fi
+  if [[ "$old_state" == running ]]; then
+    docker start "$original_id" >/dev/null && _wait_ready || {
+      _warn "The previous sandbox was restored by name but could not become ready."
+      return 1
+    }
+  fi
+  _warn "Replacement failed; the previous sandbox was restored in its ${old_state} state."
+}
+
 _replace_container() {
   local old_state="$1" target_image="$2" image_source="$3" cpus="$4" memory="$5" pids="$6" restart_policy="$7"
-  local previous="${SANDBOX}.prev" restored=false
+  local previous="${SANDBOX}.prev"
   if _resource_exists container "$previous"; then
     _die "Cannot replace ${SANDBOX}: recovery container ${previous} already exists. Inspect it manually before retrying."
   fi
 
+  # Arm EXIT/signal recovery before the first mutation, including a stop that
+  # succeeds at the daemon but whose client subsequently reports failure.
+  REPLACEMENT_ID="$(docker container inspect --format '{{.Id}}' "$SANDBOX")"
+  REPLACEMENT_STATE="$old_state"
   _notice "Replacing ${SANDBOX} transactionally..."
   if [[ "$old_state" == "running" ]]; then
     docker stop "$SANDBOX" >/dev/null || _die "Could not stop ${SANDBOX}; replacement was not started."
   fi
   docker rename "$SANDBOX" "$previous" \
-    || _die "Could not preserve ${SANDBOX} as ${previous}; replacement was not started."
+    || _die "Could not preserve ${SANDBOX} as ${previous}; restoring the previous sandbox."
 
   if _create_container "$target_image" "$image_source" "$cpus" "$memory" "$pids" "$restart_policy" \
     && docker start "$SANDBOX" >/dev/null \
     && _wait_ready; then
+    # Readiness commits the replacement. A later interruption can leave a
+    # stopped .prev for manual cleanup, but must not roll back a ready sandbox.
+    REPLACEMENT_ID=""
     docker container rm "$previous" >/dev/null \
       || _warn "Replacement succeeded, but Docker could not remove ${previous}."
     _restart_forwarders
@@ -726,22 +800,7 @@ _replace_container() {
     return 0
   fi
 
-  _warn "The replacement did not become ready; restoring the previous sandbox."
-  if _resource_exists container "$SANDBOX"; then
-    docker container rm --force "$SANDBOX" >/dev/null 2>&1 || true
-  fi
-  if docker rename "$previous" "$SANDBOX"; then
-    restored=true
-    if [[ "$old_state" == "running" ]]; then
-      docker start "$SANDBOX" >/dev/null \
-        || _die "Replacement failed and the previous sandbox was renamed back, but it could not be restarted."
-      _wait_ready || _die "Replacement failed and the previous sandbox restarted but did not become ready."
-    fi
-  fi
-  if [[ "$restored" == true ]]; then
-    _die "Replacement failed; the previous sandbox was restored in its ${old_state} state."
-  fi
-  _die "Replacement failed and automatic rollback could not restore ${SANDBOX}; inspect ${previous} immediately."
+  _die "The replacement did not become ready; restoring the previous sandbox."
 }
 
 _command_up() {

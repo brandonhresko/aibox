@@ -303,6 +303,13 @@ step 1 through step 9.
    container back, and restore its previous state: start it only if it was
    running. Report what happened.
 
+Recovery is armed before stopping the original and also runs on rename errors
+and catchable HUP/INT/TERM interruptions, while the mutex is still held. The
+original is identified by container ID so a failed rename can be distinguished
+from a completed one. An uncatchable interruption may leave `<name>.prev`;
+subsequent project commands refuse to create or change a sandbox until that
+recovery container is inspected and restored or retired manually.
+
 Recovery restores the previous container, not necessarily every filesystem
 change: a failed replacement's entrypoint may have written to the shared home.
 The entrypoint is therefore restrained and idempotent: it creates files only
@@ -440,6 +447,10 @@ Default image:
   entrypoint, and `~/.aibox/Dockerfile.extra` if present. The image is rebuilt
   when the tag is missing or the label differs from the current fingerprint.
   This replaces the manual `docker rmi` step for development builds.
+- Generated build inputs are snapshotted once per invocation in a private
+  `~/.aibox/build.XXXXXX/` directory. Fingerprinting and the Docker build use
+  that same snapshot; simultaneous operations on other projects cannot
+  overwrite it. Normal exit and catchable interruptions remove the directory.
 - "Build inputs unchanged" and "base image current" are separate questions.
   Only the first is checked automatically; `up --rebuild` answers the second
   by building with `--pull`.
@@ -472,6 +483,8 @@ touched:
   command through its real entrypoint, checking the effective UID, the home
   directory, and the presence of `sleep`. This takes about a second and stays
   far smaller than arbitrary-image support.
+- Every runtime probe check must succeed before the success marker is printed;
+  a failure must reject the image before the original container is stopped.
 - A custom image is recorded on the container as `aibox.image-source=custom`
   and is never replaced by the default when the CLI version changes.
 
@@ -527,6 +540,8 @@ later.
   is creation configuration, and adding one would require a replacement.
 - AI Box refuses to operate against a remote Docker context. Bind paths belong
   to the daemon host, so the Docker endpoint must be a local socket.
+  Resolve `DOCKER_CONTEXT` before `DOCKER_HOST`, then pass the validated local
+  endpoint explicitly to Docker for the rest of the invocation.
 
 Dev-server access is an explicit forward through a small sidecar:
 
@@ -619,8 +634,7 @@ Deeper one-click integrations can be adapters later.
 ```text
 ~/.aibox/
   config             # key=value: node_version, cpus, memory, pids
-  Dockerfile         # generated at build (regenerated each build)
-  entrypoint.sh      # generated at build
+  build.XXXXXX/      # private invocation snapshot: Dockerfile, entrypoint.sh, .dockerignore
   Dockerfile.extra   # optional, user-authored; part of the fingerprint
   locks/<name>       # sandbox mutexes (symlink -> owner PID)
   sessions/<name>/   # live session markers (one file per PID)
