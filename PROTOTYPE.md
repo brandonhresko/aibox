@@ -79,8 +79,9 @@ The first prototype will not include:
 - Automatic installation of Docker, Homebrew, coding agents, or host services.
 - Backup, restore, or CLI self-update commands. A manual export and import
   procedure is documented instead (section 5.3).
-- Support for arbitrary container images. Only the default image and documented
-  derivatives are supported (section 5.9).
+- Compatibility with arbitrary container images. The default image,
+  derivatives, and independently built images that satisfy the fixed contract
+  are supported; AI Box does not adapt incompatible images (section 5.9).
 - Shared authentication across projects (section 6).
 - A claim that ordinary Docker containers are equivalent to microVM isolation.
 - Cloud infrastructure provisioning.
@@ -251,13 +252,15 @@ Lifecycle transitions:
 
 | Container state | Command | Result |
 |---|---|---|
-| absent | `up`, `run`, `shell` | create, start, wait for ready |
+| absent | `up`, `run`, `shell`, `port-forward` | create, start, wait for ready |
 | `Created`, never ran | `up`, `run`, `shell` | replace (nothing to lose) |
 | stopped | `run`, `shell` | start, enter; notice if image is stale |
+| stopped | `port-forward` | start without replacement, then create or reuse the sidecar |
 | stopped | `up` | start; apply live changes; replace if a replace-class change is requested or the image is stale |
 | running, idle | `run`, `shell` | enter; notice if image is stale |
 | running, idle | `up` | apply live changes; replace if needed |
 | running, active | `run`, `shell` | enter |
+| running, any activity | `port-forward` | create or reuse the sidecar without replacement |
 | running, active | `up`, live-class only | apply |
 | running, active | `up`, replace-class | refuse, print the command to run after `stop` |
 | foreign schema (section 5.17) | any | refuse |
@@ -331,10 +334,15 @@ Session markers:
 
 Idle-process identification:
 
-- The container runs with `--init`, so PID 1 is the init process and its only
-  child is the idle `sleep`. `docker top` output is read with PID, parent PID,
-  and arguments; anything other than PID 1 and its `sleep` child counts as
-  active. Agents, dev servers, shells, and a `tmux` server all count.
+- The container runs with `--init`, so the init process and its only child, the
+  idle `sleep`, are the two expected processes. The implementation must not
+  assume that `docker top` reports the init process as literal PID 1: Docker
+  may report daemon-namespace PIDs. It reads the init PID from
+  `docker inspect .State.Pid`, then reads `docker top` with PID, parent PID,
+  and arguments and identifies that init plus its direct idle child. Anything
+  else counts as active. Agents, dev servers, shells, and a `tmux` server all
+  count. Milestones 2 and 4 verify the representation on Docker Desktop and
+  native Linux respectively.
 - `docker top` exit status is checked separately from its output. A failed
   inspection means "cannot establish safety" and refuses a replacement; it
   never reads as zero processes.
@@ -393,6 +401,11 @@ Command semantics:
   runs them as a command.
 - `stop` stops the container and this project's forwarders. `stop --all` stops
   every schema-3 container and forwarder on the daemon.
+- `port-forward` follows the non-replacing lifecycle of `run` and `shell`: it
+  creates the default sandbox if absent, starts it if stopped, and never
+  replaces it. It refuses foreign resources. The sandbox mutex is held while
+  the target is established and the sidecar is created, so an explicit `up`
+  cannot replace the target between those operations.
 - `remove` stops and removes the container, forwarders, and network, and states
   that the home volume is retained and how to delete it. `remove --purge` also
   deletes the volume after confirmation.
@@ -444,6 +457,10 @@ Fixed compatibility contract for derivatives and custom images:
   `~/.aibox/Dockerfile.extra` (appended to the generated Dockerfile, so its
   contents are part of the fingerprint) or as a separately built image passed
   with `up --image`.
+- A separately built custom image does not have to inherit from the default
+  image, but it receives no compatibility adaptation: it is supported only if
+  it independently satisfies every item in this contract. Derivatives are the
+  recommended path.
 
 Validation of `up --image IMAGE`, performed before an existing container is
 touched:

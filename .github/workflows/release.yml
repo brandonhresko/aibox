@@ -1,9 +1,9 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  # Disabled for the fork during prototype development. A manual run is still
+  # visible for inspection, but tags cannot publish to the upstream package.
+  workflow_dispatch:
 
 jobs:
   github:

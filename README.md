@@ -1,3 +1,5 @@
+> **Prototype branch notice:** This README describes the inherited Claude-focused v2; the in-progress agent-neutral prototype is specified in [PROTOTYPE.md](PROTOTYPE.md).
+
 <p align="center">
   <h1 align="center">aibox</h1>
   <p align="center"><strong>Persistent Docker sandboxes for Claude Code</strong></p>
