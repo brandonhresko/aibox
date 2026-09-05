@@ -1,20 +1,29 @@
 # AI Box Minimal Sandbox Prototype
 
-## Status
+## 0. Status
 
-This document defines the scope for the next AI Box prototype. It is a
-planning document, not a description of the current implementation.
+This document is the specification and the development plan for the next AI
+Box prototype. It is a planning document, not a description of the current
+implementation. Implementers work from this document. Where it is ambiguous,
+take the conservative reading (refuse rather than act, preserve rather than
+replace) and note the choice in the commit message.
 
-Revised 2026-09-04 after a review of the Claude revamp branch and a follow-up
-discussion. For this branch it supersedes two settled decisions in `REVAMP.md`:
-D5 (one global home volume sliced per project) and D9 (wildcard Caddy proxy).
-`REVAMP.md` stays in the repository as the history of v2.
+Second revision, 2026-09-04, after three rounds of review. For this branch it
+supersedes two settled decisions in `REVAMP.md`: D5 (one global home volume
+sliced per project) and D9 (wildcard Caddy proxy). `REVAMP.md` stays in the
+repository as the history of v2. Statements marked "verified" were tested on
+Docker Desktop 29 (cgroup v2) on macOS 26 during review.
 
-The prototype starts from the revamp branch and deliberately narrows the
+The prototype starts from the Claude revamp branch and deliberately narrows the
 product. Its purpose is to validate one layer well: a persistent, isolated local
 execution environment for AI coding tools and ordinary development commands.
 
-## Product boundary
+The adversarial test for every decision below: does AI Box make entering a
+persistent development environment predictably safer and easier than
+remembering Docker commands? Its value comes from reliable lifecycle behavior
+and useful errors, not from features.
+
+## 1. Product boundary
 
 AI Box owns the local sandbox lifecycle. It creates, starts, enters, inspects,
 stops, and explicitly removes project environments backed by Docker.
@@ -34,20 +43,18 @@ AI Box project sandbox
 Docker runtime
 ```
 
-The conceptual boundary in one line:
-
 > AI Box preserves the environment. The agent preserves the conversation. The
 > user's transport preserves access.
 
-## Prototype goals
+## 2. Prototype goals
 
 1. Start or recover one persistent sandbox for the current project.
 2. Run any command inside that sandbox without agent-specific orchestration.
-3. Keep the selected project writable while hiding the rest of the host
-   filesystem by default.
+3. Keep the selected project writable while mounting nothing else from the
+   host.
 4. Preserve the sandbox home across disconnects, stops, and container
-   recreation.
-5. Keep destructive lifecycle operations explicit.
+   replacement.
+5. Keep destructive and replacing lifecycle operations explicit.
 6. Support practical CPU, memory, and process limits using Docker-native
    controls, changed live where Docker allows it.
 7. Reach a dev server inside the sandbox from the host browser through an
@@ -58,7 +65,7 @@ The conceptual boundary in one line:
    without changing directories or editing the project.
 10. Forward host environment values only when the user names them explicitly.
 
-## Explicit non-goals
+## 3. Explicit non-goals
 
 The first prototype will not include:
 
@@ -70,36 +77,56 @@ The first prototype will not include:
 - Automatic worktree or pull-request management.
 - Wildcard dev-server hostnames or a shared reverse proxy.
 - Automatic installation of Docker, Homebrew, coding agents, or host services.
-- Backup, restore, or CLI self-update commands.
+- Backup, restore, or CLI self-update commands. A manual export and import
+  procedure is documented instead (section 5.3).
+- Support for arbitrary container images. Only the default image and documented
+  derivatives are supported (section 5.9).
+- Shared authentication across projects (section 6).
 - A claim that ordinary Docker containers are equivalent to microVM isolation.
 - Cloud infrastructure provisioning.
 
 The revamp's `serve`, `sessions`, and `rc-resume` functionality is therefore
-outside the prototype core. It may later exist as a separate adapter or
-integration, but it must not determine the core architecture.
+outside the prototype core. It may later exist as a separate adapter, but it
+must not determine the core architecture.
 
-## Implementation strategy
+## 4. Implementation strategy
 
-The prototype is a carve-down of the existing `bin/aibox`, not a rewrite. The
-revamp's container core went through several review rounds and encodes Docker
-behavior that must not be rediscovered. The following existing behavior is
-retained:
+### 4.1 Carve, do not rewrite
+
+The prototype is a carve-down of the existing `bin/aibox`. The revamp's
+container core went through several review rounds and encodes Docker behavior
+that must not be rediscovered. Retain as-is:
 
 - Docker readiness checks and auto-start of an installed but stopped runtime.
 - Image availability check and the embedded Dockerfile build.
-- Race-safe container creation using the `mkdir` lock.
-- Recovery from containers wedged in the `Created` state.
-- Normalization of stray `docker inspect` output.
-- TTY allocation only when stdin and stdout are terminals.
 - Container startup polling.
-- Active-process detection before recreation.
+- TTY allocation only when stdin and stdout are terminals.
 - `--restart unless-stopped` and `--init` around `sleep infinity`.
 - Same-path bind mounting of the project.
-- Bash 3.2 compatibility: no associative arrays, no `mapfile`.
+- Bash 3.2 compatibility: no associative arrays, no `mapfile`, no `${var,,}`.
 - The existing `run`, `shell`, `stop`, and `status` mechanics.
 
-The following is removed in the first carve. All of it remains in Git history
-and may return later as adapters or separately scoped features:
+### 4.2 Inherited code that must be corrected
+
+The inherited lifecycle protections are useful but not safe enough to keep
+unchanged. Each of these is a defect in the current `_ensure_container` and
+its helpers, and each has a specified fix in section 5.6:
+
+- The creation lock is stolen after roughly 15 seconds without establishing
+  that its owner died.
+- A failed `docker top` collapses to an apparent count of zero active
+  processes, which reads as "safe to replace".
+- Idle processes are excluded by matching the text `sleep infinity` rather than
+  by identifying the actual idle processes.
+- The creation lock is released before the requested command launches, leaving
+  a window in which another invocation can replace the container.
+- Readiness waits on the Claude installer's marker; readiness must be
+  independent of any agent installer.
+
+### 4.3 Deletions
+
+Removed in the first carve. All of it remains in Git history and may return
+later as adapters or separately scoped features:
 
 - `serve`, `sessions`, `rc-resume`, and the embedded UI payloads.
 - Caddy generation, the shared proxy, and its lifecycle.
@@ -107,29 +134,39 @@ and may return later as adapters or separately scoped features:
   and `CLAUDE.md` edits, and the `claude`-default dispatch that turned
   `aibox --resume` into a Claude call.
 - `--yolo` and `--copy`.
-- The global volume-layout migration and `scripts/migrate-to-v2.sh`.
+- The volume-subpath slice mounts, the global layout migration, the helper
+  containers that supported them, and `scripts/migrate-to-v2.sh`.
 - `backup`, `restore`, `update`, and the npm update check.
 - `ANTHROPIC_*` environment forwarding.
+- Automatic container replacement from `run` and `shell`.
 
-## Proposed architecture
+## 5. Architecture
 
-### Sandbox identity
+### 5.1 Identity and labels
 
 - One persistent sandbox per absolute project directory.
-- Project identity is the canonical absolute path, symlinks resolved. The
-  sandbox name is `aibox-<slug>-<hash>`: `<slug>` is the sanitized directory
-  basename and `<hash>` is a prefix of the SHA-256 of the path.
-- The project container and its private home volume share that name. Docker
-  namespaces containers and volumes separately, so there is no conflict.
-- Every Docker resource AI Box creates is labeled with the project path, slug,
-  hash, and the CLI version that created it.
-- Multiple terminals may execute commands in the same sandbox.
-- Concurrent creation must be race-safe.
+- Project identity is the canonical absolute path, symlinks resolved. Moving or
+  renaming a project directory changes its identity; the old sandbox remains
+  until removed.
+- The sandbox name is `aibox-<slug>-<hash>`: `<slug>` is the sanitized
+  directory basename and `<hash>` is a prefix of the SHA-256 of the path. The
+  project container, its private home volume, and its network all share that
+  name. Docker namespaces containers, volumes, and networks separately.
+- Every resource AI Box creates carries these labels: `aibox.schema=3`,
+  `aibox.path`, `aibox.slug`, `aibox.hash`, `aibox.version` (creating CLI
+  version), and `aibox.role` (`sandbox` or `forward`). Containers also carry
+  `aibox.image-source` (`default` or `custom`). Forwarders also carry
+  `aibox.forward.host` and `aibox.forward.port`.
+- Schema 3 distinguishes prototype resources from v1 (unlabeled, compose) and
+  v2 (`aibox.layout=2`) resources. See section 5.17.
+- Multiple terminals may execute commands in the same sandbox. They share one
+  writable checkout and one home; AI Box does not isolate terminals from each
+  other.
 - Named instances and automatic task-level containers are deferred.
 
-### Workspace exposure
+### 5.2 Workspace exposure
 
-- Mount only the selected project directory from the host by default.
+- Mount only the selected project directory from the host.
 - Mount it read/write at the same absolute path inside the container.
 - Do not mount the host home directory or unrelated parent directories.
 - Do not mount the Docker socket.
@@ -137,100 +174,187 @@ and may return later as adapters or separately scoped features:
   configuration, or other dotfiles.
 - A copied or ephemeral workspace mode is a later, separate capability.
 
-The default sandbox protects the rest of the host; it does not protect the
-selected project from intentional or accidental edits. Git remains the primary
-recovery mechanism for project files.
+The default sandbox protects the rest of the host filesystem; it does not
+protect the selected project from intentional or accidental edits. Git remains
+the primary recovery mechanism for project files.
 
-### Persistent state
+### 5.3 Persistent state
 
 - Each project gets one ordinary named Docker volume as its private home,
-  mounted at the container user's home directory.
+  mounted at `/home/aibox`.
 - Agent credentials, shell configuration, caches, agent state, and
   user-installed tooling inside that home are opaque to AI Box.
-- The home volume survives container recreation and is deleted only by
+- The home volume survives container replacement and is deleted only by
   `remove --purge`.
-- Nothing is installed into the home directory at image-build time: the volume
-  mounts over it and shadows the contents. Agent binaries belong in the image,
-  installed outside the home directory. Only authentication and state belong in
-  the home volume. An in-home Claude install measured roughly 650 MB; with a
-  private home per project it would be duplicated and separately updated in
-  every project.
+- Volume semantics, verified: an empty named volume receives the image's
+  contents at the mount path on first use. A populated volume does not receive
+  later image contents. Consequence: anything the image places in the home
+  directory reaches new sandboxes only, never existing ones, so agent binaries
+  and other image-managed tools must be installed outside the home directory.
+  Only authentication and state belong in the home volume. An in-home Claude
+  install measured roughly 650 MB and would be duplicated per project.
 - The core uses no `volume-subpath` mounts, helper containers, layout markers,
-  or layout migration. This is a simplicity choice, not a compatibility one:
-  every Docker Engine since 26 supports subpath mounts, and adapters may use
-  them.
-- The container definition supports a list of additional mounts, each a volume,
-  an optional subpath, a destination, and a read-only flag. The first prototype
-  creates only the private home entry. Docker orders nested mounts by
-  destination depth, so a later entry may sit under an earlier one.
-- The entrypoint fixes ownership of every mountpoint on each start, because
-  Docker creates nested mountpoints root-owned. A recursive ownership pass over
-  the whole home runs once per volume, recorded by a marker file, not on every
-  start.
+  or layout migration. The mount code is a single list so that a future
+  adapter can append entries; no other adapter machinery exists in the core.
+- The entrypoint ensures the home mountpoint is owned by the container user.
+  It does not run a recursive ownership pass; data copied in by hand is chowned
+  at copy time.
 - Do not rely on the container writable layer for state that must survive an
   image update. `apt` installs persist across stop and start but reset on
-  recreation; `~/.aibox/Dockerfile.extra` is the way to keep them.
+  replacement; a derivative image (section 5.9) is the way to keep them.
 
-This trades one-login-across-all-projects convenience for a simpler
-agent-neutral boundary. Shared authentication is designed for below and
-implemented later as opt-in adapters.
+Manual export and import, documented in the README in place of backup commands.
+The sandbox must be stopped for a consistent copy:
 
-### Sandbox definition and change policy
+```sh
+docker run --rm -v <name>:/v:ro -v "$PWD":/out alpine tar czf /out/<name>.tgz -C /v .
+docker run --rm -v <name>:/v    -v "$PWD":/in  alpine sh -c 'cd /v && tar xzf /in/<name>.tgz'
+```
+
+### 5.4 Sandbox definition and change policy
 
 The running container is the sandbox definition. `docker inspect` is the read
 API: resource limits from `HostConfig`, the image by ID, mounts from the mount
-list. Labels carry identity only, plus whether the image is the AI Box default
-or user-supplied. Labels are immutable, so no live-updatable value is ever
-stored in one. AI Box writes no per-sandbox definition file on the host.
+list, image source from the label. AI Box writes no per-sandbox definition file
+on the host. Two consequences are stated plainly to users:
 
-Verified against Docker Desktop 29 on cgroup v2:
+- `remove` retains home data, not environment configuration. Image choice and
+  limits are gone with the container; `up` recreates from defaults.
+- Replacement (section 5.5) reads the old container's settings before acting
+  and carries them forward. Omitted `up` flags preserve existing values.
+
+Replacement is explicit. `run` and `shell` start or enter the existing
+environment and never replace it. Having no active processes does not make an
+environment disposable: system packages and other writable-layer changes are
+part of it. When the default image has changed, `run` and `shell` print a
+one-line notice naming `aibox up`. The only exception is a container in the
+`Created` state that never ran; it has no environment to lose and is replaced.
+
+Verified live-versus-replace behavior of `docker update`:
 
 | Setting | Changes live? | Notes |
 |---|---|---|
-| CPU quota (`--cpus`) | Yes, raise or lower | Cannot be cleared once set. Removing the limit is a recreate, or set it to the host CPU count |
-| Memory | Yes, only with `--memory-swap` passed alongside | Alone, the update is rejected. Swap is set equal to memory so the limit is real. Cannot be cleared live. Lowering below current use triggers reclaim or OOM, so warn first |
-| Process limit | Yes, including clearing it | |
+| CPU quota (`--cpus`) | Yes, raise or lower | Cannot be cleared once set. Clearing is a replacement |
+| Memory | Yes, only with `--memory-swap` passed alongside | Alone the update is rejected. Swap is set equal to memory so the limit is real. Cannot be cleared live; clearing is a replacement. Lowering below current use triggers reclaim or OOM: warn first |
+| Process limit | Yes, including clearing | |
 | Restart policy | Yes | |
-| Image | No | Compared by image ID, not tag, so a rebuilt custom image or a dev-mode rebuild is detected |
-| Mounts, including future shared-auth mounts | No | |
-| Ports published on the project container | No | Never used: forwards are sidecars |
-| Hostname, extra hosts, init, user, working directory, devices, GPU, labels | No | |
+| Image | No | Compared by image ID, never by tag |
+| Mounts | No | |
+| Network membership | Live via `docker network connect`, unused | |
+| Ports on the project container | Never used | Forwards are sidecars |
+| Hostname, extra hosts, init, user, working directory, devices, labels | No | |
 
 `docker update` also applies to stopped containers and takes effect at the next
 start.
 
-Policy:
+Lifecycle transitions:
 
-- `run` and `shell` never change the definition. They ensure the container
-  exists and is running. The one convergence they keep is the default image
-  following the CLI version and `node_version`; it is deferred with a warning
-  while processes are active, because that desired state is recomputed on every
-  run.
-- `up` with flags applies live-class changes immediately, running or stopped. A
-  recreate-class change recreates the container only when no processes are
-  active.
-- A recreate-class change requested while processes are active is refused with
-  the exact command to run after `stop`. It is not deferred: there is nowhere
-  to remember the intent without a definition file.
-- The active-process check is the existing one: `docker top` minus the idle
-  process. Agents, dev servers, shells, and a `tmux` server all count as
-  active.
+| Container state | Command | Result |
+|---|---|---|
+| absent | `up`, `run`, `shell` | create, start, wait for ready |
+| `Created`, never ran | `up`, `run`, `shell` | replace (nothing to lose) |
+| stopped | `run`, `shell` | start, enter; notice if image is stale |
+| stopped | `up` | start; apply live changes; replace if a replace-class change is requested or the image is stale |
+| running, idle | `run`, `shell` | enter; notice if image is stale |
+| running, idle | `up` | apply live changes; replace if needed |
+| running, active | `run`, `shell` | enter |
+| running, active | `up`, live-class only | apply |
+| running, active | `up`, replace-class | refuse, print the command to run after `stop` |
+| foreign schema (section 5.17) | any | refuse |
+| any | `stop` | stop container and its forwarders |
+| any | `remove` | stop; remove container, forwarders, network; keep volume; say so |
+| any | `remove --purge` | as `remove`, then delete the volume after confirmation |
+
+Clearing a limit is explicit: `--cpus 0`, `--memory 0`, or `--pids 0` means
+unlimited. Clearing the process limit is live; clearing CPU or memory is a
+replacement.
 
 Critical lifecycle invariant:
 
-> AI Box may automatically start a stopped container. It must never
-> automatically destroy a running container that has processes in it.
+> AI Box may automatically start a stopped container. It must never destroy a
+> running container that has processes in it, and it must never replace a
+> container except from an explicit `up`.
 
-### Command interface
+### 5.5 Replacement procedure
+
+`up` replaces a container in this order. The mutex (section 5.6) is held from
+step 1 through step 9.
+
+1. Acquire the sandbox mutex.
+2. Establish idleness: no live session markers, `docker top` succeeds, and it
+   shows only the idle processes. Any failure to establish this refuses the
+   replacement.
+3. Read the old container's image source, image ID, limits, and restart
+   policy. Merge the requested changes over them.
+4. Resolve the target image: build the default image if its fingerprint is
+   stale or it is missing; validate a custom image against the contract
+   (section 5.9). Fail here before anything is touched.
+5. Record whether the old container was running, then stop it. Both containers
+   mount the same home volume, and two entrypoints must never write to it
+   concurrently.
+6. Rename the old container aside, to `<name>.prev`.
+7. Create the replacement under the canonical name with the merged settings,
+   start it, and wait for the readiness marker.
+8. On success, remove the old container and restart any stopped forwarders.
+9. On failure, remove the failed replacement if it exists, rename the old
+   container back, and restore its previous state: start it only if it was
+   running. Report what happened.
+
+Recovery restores the previous container, not necessarily every filesystem
+change: a failed replacement's entrypoint may have written to the shared home.
+The entrypoint is therefore restrained and idempotent: it creates files only
+when absent and changes ownership only on the mountpoint.
+
+### 5.6 Concurrency, locking, and safety checks
+
+Sandbox mutex:
+
+- One lock per sandbox at `~/.aibox/locks/<name>`, implemented as a symlink
+  whose target is the owner's PID. Symlink creation is atomic and carries the
+  owner, so there is no window between taking the lock and recording who holds
+  it. Verified on macOS bash 3.2.
+- A waiter polls. A lock whose owner PID is dead, or alive but not an `aibox`
+  process, is stale: the waiter removes it and retries.
+- A holder releases only a lock that still names its own PID.
+- Residual case, accepted and documented: two waiters racing to remove the same
+  dead lock.
+
+Session markers:
+
+- `run` and `shell` write `~/.aibox/sessions/<name>/<pid>` before acquiring the
+  mutex and remove it on exit through a trap. A marker whose PID is dead is
+  stale and ignored.
+- `up` reads markers only while holding the mutex. Because a session's marker
+  write precedes its mutex acquisition, any session `up` does not see will
+  block on the mutex and then find the post-replacement state. This closes the
+  window between a session's container check and its `docker exec`.
+
+Idle-process identification:
+
+- The container runs with `--init`, so PID 1 is the init process and its only
+  child is the idle `sleep`. `docker top` output is read with PID, parent PID,
+  and arguments; anything other than PID 1 and its `sleep` child counts as
+  active. Agents, dev servers, shells, and a `tmux` server all count.
+- `docker top` exit status is checked separately from its output. A failed
+  inspection means "cannot establish safety" and refuses a replacement; it
+  never reads as zero processes.
+
+Readiness:
+
+- The entrypoint removes and then writes a readiness marker after its own
+  setup (mountpoint ownership, shell skeleton). `run`, `shell`, and `up` wait
+  briefly for it. Readiness depends on nothing but the entrypoint.
+
+### 5.7 Command surface and parsing
 
 ```text
 aibox                                   # concise help plus this project's status; never launches an agent
-aibox [--dir PATH] up [--image IMAGE] [--cpus N] [--memory SIZE] [--pids N]
+aibox [--dir PATH] up [--image IMAGE] [--cpus N] [--memory SIZE] [--pids N] [--rebuild]
 aibox [--dir PATH] run [--env NAME]... <command> [arguments...]
 aibox [--dir PATH] shell [command...]
 aibox [--dir PATH] stop [--all]
 aibox [--dir PATH] status
-aibox [--dir PATH] remove [--purge]
+aibox [--dir PATH] remove [--purge] [--yes]
 aibox [--dir PATH] port-forward PORT|HOST_PORT:CONTAINER_PORT ...
 aibox [--dir PATH] port-forward --list | --stop PORT | --stop-all
 aibox version
@@ -241,90 +365,115 @@ Parsing rules:
 
 - Global flags are accepted only before the command word. `--dir` is the only
   global flag.
-- `--image` and the resource flags belong to `up` only. On `run`, a differing
-  image could only recreate silently, be ignored silently, or be deferred, and
-  all three are wrong.
+- `--image`, the resource flags, and `--rebuild` belong to `up` only. On `run`,
+  a differing image could only replace silently, be ignored silently, or be
+  deferred, and all three are wrong.
 - `run` parses `--env` only between `run` and the program name. Everything from
   the program name on passes through verbatim. A `--` ends AI Box parsing.
-- Unknown command: one-line error with a help hint, exit 1. No interactive
-  prompts except the `remove --purge` confirmation.
+- Unknown command: one-line error with a help hint, exit 2. No interactive
+  prompts except the `remove --purge` confirmation, which `--yes` skips for
+  scripts and tests.
 
-`aibox run` is the fundamental agent-neutral operation. Examples include:
+Command semantics:
 
-```sh
-aibox run codex
-aibox run claude
-aibox run opencode
-aibox run npm test
-```
+- `aibox run` is the fundamental agent-neutral operation: `aibox run codex`,
+  `aibox run claude`, `aibox run npm test`. If the program is not found inside
+  the sandbox, `run` prints an actionable message naming the two installation
+  paths (install inside the persistent home, or bake into a derivative image)
+  instead of a bare exit 127.
+- `--dir` selects the project without requiring the caller to `cd` first,
+  which is what scripts and user-chosen remote tools need. AI Box canonicalizes
+  the path before deriving the identity and rejects broad targets: `/`, the
+  user's home directory, `/Users`, `/home`, `/Volumes`, `/mnt`, `/tmp`, `/var`,
+  `/etc`, `/usr`, `/opt`, `/private`, and any path containing `:`.
+- `up` creates or starts the sandbox without running anything, applies limits,
+  and is the only command that replaces a container. `--rebuild` rebuilds the
+  default image with `--pull` and then replaces.
+- `shell` opens `zsh`, falling back to `bash`, then `sh`. With arguments it
+  runs them as a command.
+- `stop` stops the container and this project's forwarders. `stop --all` stops
+  every schema-3 container and forwarder on the daemon.
+- `remove` stops and removes the container, forwarders, and network, and states
+  that the home volume is retained and how to delete it. `remove --purge` also
+  deletes the volume after confirmation.
+- Agent shortcuts may eventually alias `aibox run`, but the core must not
+  depend on one agent's session format, remote-control service, or
+  authentication layout.
 
-`--dir` selects the project without requiring the caller to `cd` first. This is
-part of the core contract because scripts and user-chosen remote tools need a
-stable way to target a project. AI Box canonicalizes the path before deriving
-the sandbox identity and rejects dangerously broad targets: `/`, the user's home
-directory, `/Users`, `/home`, `/Volumes`, `/mnt`, `/tmp`, `/var`, `/etc`,
-`/usr`, `/opt`, `/private`, and any path containing `:`.
+### 5.8 Output and exit status
 
-`up` creates or starts the sandbox without running anything, so a remote caller
-can pre-warm a project before attaching, and it is where the image and resource
-limits are set.
+- Every AI Box notice, warning, and error goes to stderr. Under `run` and
+  `shell`, stdout belongs to the program, so `aibox run cmd | other` works.
+- `run` and `shell` exit with the program's exit status. AI Box's own failures
+  exit 1; usage errors exit 2.
+- `status`, `version`, `help`, and `port-forward --list` write their report to
+  stdout.
+- Forwarded environment values are never printed. Names may be.
 
-`stop` stops the container and this project's port forwards. `stop --all` stops
-every AI Box container and sidecar.
+### 5.9 Image
 
-`remove` stops and removes the container and this project's port forwards, and
-states that the home volume is retained and how to delete it. `remove --purge`
-also deletes the home volume, after confirmation.
+Default image:
 
-If the requested program is not found inside the sandbox, `run` prints an
-actionable message naming the two installation paths rather than a bare exit
-127.
+- `node:<node_version>-bookworm` plus a small baseline: `zsh sudo ripgrep fzf
+  jq less procps curl tmux`. Node stays because agent CLIs and MCP servers are
+  overwhelmingly npm-distributed; `tmux` is the neutral detached-session tool
+  (section 5.13).
+- User `aibox`, UID 1000, home `/home/aibox`, passwordless sudo, login shell
+  `zsh`. The base image's `node` user at UID 1000 is removed first.
+- Tag `aibox:<cli-version>-node<node_version>`. Git checkouts run as version
+  `dev`.
+- Build fingerprint: the image carries a label with the SHA-256 of all AI Box
+  controlled build inputs concatenated: the generated Dockerfile, the generated
+  entrypoint, and `~/.aibox/Dockerfile.extra` if present. The image is rebuilt
+  when the tag is missing or the label differs from the current fingerprint.
+  This replaces the manual `docker rmi` step for development builds.
+- "Build inputs unchanged" and "base image current" are separate questions.
+  Only the first is checked automatically; `up --rebuild` answers the second
+  by building with `--pull`.
+- Built with `docker build --pull`.
 
-Agent shortcuts may eventually alias `aibox run`, but the core must not depend
-on one agent's session format, remote-control service, or authentication layout.
+Fixed compatibility contract for derivatives and custom images:
 
-### Image selection
+- User `aibox`, UID 1000, home `/home/aibox`.
+- The entrypoint passes the command through (executes its arguments after its
+  own setup).
+- `sleep` and `sh` exist. `zsh` or `bash` is optional.
+- AI Box supplies `--init`, the idle command, the working directory, and all
+  mounts; the image sets none of them.
+- Derivatives are built `FROM` the default image, either through
+  `~/.aibox/Dockerfile.extra` (appended to the generated Dockerfile, so its
+  contents are part of the fingerprint) or as a separately built image passed
+  with `up --image`.
 
-- AI Box supplies a default image for the zero-configuration path:
-  `node:<node_version>-bookworm` plus a small baseline. Node stays in the
-  baseline because agent CLIs and MCP servers are overwhelmingly
-  npm-distributed. `tmux` joins the baseline (see Agent sessions).
-- `up --image IMAGE` selects a compatible existing image. The choice is recorded
-  on the container: a label marks it user-supplied, so later runs do not replace
-  it with the default when the CLI version changes. AI Box validates image names
-  before passing them to Docker.
-- A changed image recreates the container under the change policy above. An
-  image change never deletes the home volume.
-- Before creating a persistent container from a user-supplied image, `up`
-  probes it with a throwaway run and fails with an actionable message if the
-  contract below is not met.
-- `~/.aibox/Dockerfile.extra` remains the primary escape hatch: appended to the
-  generated Dockerfile, it is how language runtimes and coding agents are baked
-  in so that they survive recreation.
+Validation of `up --image IMAGE`, performed before an existing container is
+touched:
 
-Custom-image contract, to be settled and tested before `--image` is treated as
-stable:
+- The image name is validated as a Docker reference before use.
+- An inherited base label is a claim, not a check: a derivative can change its
+  user, entrypoint, or files while keeping the label. So the image config is
+  inspected for user and entrypoint, and the image is run once with a trivial
+  command through its real entrypoint, checking the effective UID, the home
+  directory, and the presence of `sleep`. This takes about a second and stays
+  far smaller than arbitrary-image support.
+- A custom image is recorded on the container as `aibox.image-source=custom`
+  and is never replaced by the default when the CLI version changes.
 
-- User or UID discovery, and the resulting ownership of files written to the
-  project bind mount and the private home.
-- Home-directory discovery, since the private volume mounts there.
-- Entrypoint handling: the image's entrypoint must pass the command through.
-- Availability of a long-running idle command, and whether images without
-  `sleep` are rejected or bootstrapped.
-- Working-directory behavior: the project path.
-- Shell fallback for `shell`: `zsh`, then `bash`, then `sh`.
+Linux ownership: files the sandbox writes to the bind mount are owned by UID
+1000 on a Linux host. Hosts whose user is not UID 1000 are a documented
+limitation of the prototype, tested in milestone 2 rather than discovered
+later.
 
-### Agent installation
+### 5.10 Agent installation
 
 - The core image supplies a small, documented Linux development baseline.
 - AI Box does not silently install or update a particular coding agent.
-- Users install tools inside the persistent project home, or bake them into the
-  image through `Dockerfile.extra`. Binaries baked into the image must live
-  outside the home directory.
+- Users install tools inside the persistent project home, or bake them into a
+  derivative image. Binaries baked into an image must live outside the home
+  directory (section 5.3).
 - Optional installation helpers or adapters must remain separable from the
   sandbox lifecycle.
 
-### Environment forwarding
+### 5.11 Environment forwarding
 
 - Do not copy the host environment wholesale into the sandbox.
 - Persisted login state inside the private project home is the preferred agent
@@ -335,39 +484,32 @@ stable:
   process argument list. Verified.
 - A named variable that is not set in the host environment is an error, not an
   empty string.
-- Do not maintain provider-specific hard-coded lists such as only `ANTHROPIC_*`
-  or `OPENAI_*`.
-- Forwarded values are never printed in status, logs, or error messages. Names
-  may be.
+- No provider-specific hard-coded lists such as only `ANTHROPIC_*` or
+  `OPENAI_*`.
 - Environment-file support is deferred until its path, storage, and accidental
   disclosure behavior are deliberately specified.
 
-### Lifecycle invariants
-
-- Exiting an agent or shell does not destroy the sandbox.
-- Losing a local or remote connection does not stop the sandbox.
-- `stop` preserves all persistent state.
-- `remove` is explicit and clearly reports which state will be retained or
-  deleted.
-- Image changes never silently delete the project home volume.
-- A change that requires recreation is refused, not applied, while processes are
-  active.
-- Two simultaneous invocations for one project converge on the same sandbox.
-- No cleanup policy silently removes active project environments.
-- Port forwards never restart the project container.
-
-### Networking and dev-server access
+### 5.12 Networking and dev-server access
 
 - Normal outbound networking is available for model APIs, package registries,
   Git hosting, and development dependencies.
-- All AI Box containers join one user-defined bridge network, `aibox`. It is
-  load-bearing: container-name resolution between forwarders and project
-  containers only works on a user-defined network.
+- Each project gets its own user-defined bridge network, named after the
+  sandbox, shared only with that project's forwarders. Containers on one
+  user-defined bridge can reach each other's listening ports, so a shared
+  bridge would let projects reach one another's dev servers and databases.
+  The network is created by the first `up`, `run`, or `shell` and removed by
+  `remove`.
+- Capacity caveat: with Docker's default address pools each bridge takes a
+  /16, which allows roughly thirty networks per daemon, and other tools consume
+  them too. Address-pool exhaustion produces an actionable error naming the
+  `default-address-pools` daemon setting, and the README documents it.
+- `host.docker.internal` resolves to the host. Host network access is on.
 - AI Box does not create a public listener, a remote ingress path, or an SSH
   server in any sandbox.
-- Ports are never published on the project container itself. A published port
-  is part of the container's creation configuration; adding one would require
-  recreation, killing agents, dev servers, shells, and `tmux` sessions.
+- Ports are never published on the project container itself: a published port
+  is creation configuration, and adding one would require a replacement.
+- AI Box refuses to operate against a remote Docker context. Bind paths belong
+  to the daemon host, so the Docker endpoint must be a local socket.
 
 Dev-server access is an explicit forward through a small sidecar:
 
@@ -376,7 +518,7 @@ Browser
   |
 127.0.0.1:HOST_PORT on the host
   |
-socat sidecar container (aibox network)
+socat sidecar container (the project's network)
   |
 project container:CONTAINER_PORT
 ```
@@ -386,15 +528,18 @@ project container:CONTAINER_PORT
   ports. Several specs may be given at once.
 - The sidecar runs a pinned `alpine/socat` image relaying to the project
   container by name. socat resolves the name per connection, so a project
-  container recreated under the same name is reachable again with no sidecar
+  container replaced under the same name is reachable again with no sidecar
   restart. Verified.
 - Loopback only. The user's chosen transport, for example an SSH local forward,
   may make that endpoint reachable elsewhere.
 - Raw TCP relay: WebSocket-based hot reload needs no special handling, and the
   browser sends a plain `localhost` Host header, which dev servers with host
   allowlists accept.
-- Sidecars are labeled with the project path, hash, host port, and container
-  port, and are found by label, never by name prefix.
+- The dev server must listen on the container's network interface, not only
+  its own loopback (for example `vite --host`). `port-forward` prints this
+  when it starts, and a connection-refused diagnosis repeats it.
+- Sidecars carry the forward labels (section 5.1) and are found by label,
+  never by name prefix.
 - Lifecycle: `stop` stops the project's sidecars, `up` restarts stopped ones,
   `remove` removes them, and `status` and `port-forward --list` show them. A
   host port already in use is reported as such.
@@ -414,7 +559,7 @@ CLI they use locally. The core properties that make this work:
 - Stable project identity, container naming, and user/home behavior.
 - No automatic mounting of SSH keys or host credentials.
 - Auto-start of an installed runtime is kept, including launching Docker
-  Desktop or OrbStack on macOS, because it is what makes an always-on machine
+  Desktop or OrbStack on macOS, because it is what lets an always-on machine
   recover from a remote invocation. If the daemon does not come up within the
   wait, the error names the runtime and the command to start it. Installation
   is never attempted.
@@ -423,12 +568,11 @@ Codex Remote SSH or VS Code reaching the host does not automatically place their
 processes inside AI Box. The prototype guarantees a stable CLI entrypoint.
 Deeper one-click integrations can be adapters later.
 
-### Agent sessions
+### 5.13 Agent sessions
 
 - The core exposes `aibox run <program> [arguments]`. The agent owns its
   transcript format, resume identifiers, retention, remote-control
-  registration, and background semantics. AI Box owns the environment the
-  agent runs in.
+  registration, and background semantics. AI Box owns the environment.
 - `tmux` is in the baseline image as the neutral way to keep an interactive
   program alive across an SSH or terminal disconnect. A `docker exec` session
   ends with its terminal; the container does not.
@@ -439,72 +583,97 @@ Deeper one-click integrations can be adapters later.
   Users set this in the agent's own settings, and a Claude adapter may later do
   it for them.
 
-### Resource controls
+### 5.14 Resource controls
 
 - Docker-native controls: CPU quota (`--cpus`), memory (`--memory`, with
   memory-swap set equal so the limit is real), and process count (`--pids`).
-  Optional device or GPU access is off by default and deferred.
+  Device or GPU access is off and deferred.
 - Defaults: process limit 4096; CPU and memory unlimited unless configured.
   Global defaults live in `~/.aibox/config`; `up` flags override them for one
-  sandbox.
-- Limits are applied live through `docker update` wherever the table above
-  allows.
+  sandbox; omitted flags preserve the sandbox's current values.
+- Limits are applied live through `docker update` wherever section 5.4 allows.
+  A live update that Docker rejects is reported verbatim and changes nothing.
 - Disk usage is reported: the container's writable layer and the home volume
-  size. Enforced disk quotas are deferred because their behavior varies by
-  Docker runtime and host filesystem.
+  size. Enforced disk quotas are deferred.
 - AI Box does not write configuration into the project.
 
-### Host state and configuration
+### 5.15 Host state and configuration
 
 ```text
 ~/.aibox/
   config             # key=value: node_version, cpus, memory, pids
   Dockerfile         # generated at build (regenerated each build)
-  Dockerfile.extra   # optional, user-authored
-  .lock-*            # transient creation locks
+  entrypoint.sh      # generated at build
+  Dockerfile.extra   # optional, user-authored; part of the fingerprint
+  locks/<name>       # sandbox mutexes (symlink -> owner PID)
+  sessions/<name>/   # live session markers (one file per PID)
 ```
 
 There are no per-sandbox definition files and no per-project files. The
-sandbox definition is the container (see above).
+sandbox definition is the container (section 5.4).
 
-### Diagnostics and inspectability
+### 5.16 Diagnostics and status
 
-- Verify that the Docker CLI exists and the daemon is reachable, auto-start an
-  installed runtime, but never install host dependencies.
-- Return actionable errors for a missing runtime, stopped daemon, incompatible
-  image, unsafe project path, failed mount, insufficient disk space (v1's host
-  disk check before builds is retained), a program not found in the sandbox,
-  and a host port already in use.
-- Label every Docker resource with its AI Box project identity and canonical
-  host path.
-- `aibox status` reports the project path, container name, image, lifecycle
-  state, configured resource limits, current CPU and memory use, relevant disk
-  usage, and active port forwards.
+- Verify that the Docker CLI exists and the daemon is reachable; auto-start an
+  installed runtime; never install host dependencies.
+- Actionable errors for: missing runtime, stopped daemon, remote Docker
+  context, incompatible image, unsafe project path, failed mount, insufficient
+  disk space (v1's host disk check before builds is retained), a program not
+  found in the sandbox, a host port already in use, address-pool exhaustion,
+  a foreign-schema resource, and a replacement refused because of active
+  processes or a failed inspection.
+- `aibox status` reports, for this project: path, sandbox name, image and
+  whether it is stale, lifecycle state, configured limits, live CPU and memory
+  use, writable-layer and home-volume disk use, active forwarders, and active
+  sessions. A retained home volume with no container is reported as such with
+  the command that recreates the container. Without a project context it lists
+  every schema-3 sandbox on the daemon.
 - Mount boundaries and forwarded environment variable names must be
   inspectable; secret values must not be displayed.
 - A larger `doctor`, `disk`, `volumes`, `clean`, or `nuke` command family is not
   part of the first prototype.
 
-### Security statement
+### 5.17 Compatibility with existing resources
+
+The prototype inherits v2's naming scheme and development image tag, so it must
+prove ownership before touching anything:
+
+- A container, volume, or network carrying the sandbox name but lacking
+  `aibox.schema=3` is foreign. Every command refuses to adopt, start, modify,
+  or remove it, and prints what it found and how to clear it by hand. In
+  particular, a v2 container with slice mounts is never started by the
+  prototype.
+- `stop --all` and the no-project form of `status` operate only on schema-3
+  resources.
+- The v2 `aibox-home` volume and the v1 `aibox-auth-*` volumes are never read,
+  written, or deleted by the CLI. `status` may note that legacy volumes exist.
+- The build fingerprint (section 5.9) prevents reuse of a stale v2 image under
+  the same development tag.
+- Publishing metadata: the checkout still carries the upstream remote,
+  `package.json` links to the original repository, and a release workflow
+  targeting the original npm package and Homebrew tap. The workflow is
+  disabled in milestone 1 so a pushed tag cannot attempt a publish; metadata is
+  retargeted in milestone 4 before any distribution.
+
+### 5.18 Security statement
 
 The prototype's security promise is intentionally limited:
 
-> Commands can control the selected project and their private container home,
-> but cannot access the rest of the host filesystem unless the user explicitly
-> grants additional access.
+> Only the selected host directory is mounted. Commands can control that
+> directory and their private container home; no other host path is mounted
+> unless the user explicitly adds one.
 
 - Processes may have administrative privileges inside the container; the
   default image has passwordless sudo.
 - Docker socket access, privileged host mode, broad host mounts, and automatic
   credential forwarding remain off by default.
-- Network access to the host is on: `host.docker.internal` resolves to the
-  host, and normal internet access is available. The promise is about the host
-  filesystem, not the host network.
+- Network access to the host and the internet is on. The promise is about
+  mounted host paths, not host network reachability.
 - On Linux hosts without user-namespace remapping, root inside the container is
   root on the bind-mounted project. Documentation must distinguish Docker's
   container boundary from stronger VM or microVM isolation.
 
-### Initial host support
+### 5.19 Initial host support
 
 - Validate first on macOS with the currently supported Docker-compatible
   runtime.
@@ -513,58 +682,32 @@ The prototype's security promise is intentionally limited:
 - Defer Windows and WSL support until path, ownership, and lifecycle behavior is
   intentionally designed and tested.
 
-## Shared authentication (later, as opt-in adapters)
+## 6. Shared authentication
 
-Shared login matters: re-authenticating Claude, Codex, and Git in every project
-becomes friction quickly. The prototype does not implement it, but must not
-paint the design into a corner.
+Deferred. Shared login matters: re-authenticating Claude, Codex, and Git in
+every project is friction, and the private-home decision is validated through
+real use (section 7) before any of this is built. The core carries exactly one
+constraint for it: the mount code stays a single list. Adapter machinery,
+nested-mount ownership handling, and a migration design are out of scope until
+an actual adapter needs them.
 
-```text
-Core:     one private project home volume
-Optional: shared Claude authentication    (adapter)
-          shared Codex authentication     (adapter)
-          shared Git identity / dotfiles  (adapter)
-```
-
-The core understands additional persistent mounts. An adapter knows where its
-agent stores authentication and which state is safe to share. Agent neutrality
-means the core does not depend on any adapter; it does not forbid
-agent-specific convenience.
-
-What a focused spike must establish, Claude first, then Codex:
+What a later spike must establish, Claude first, then Codex:
 
 - Claude's config directory mixes shareable files (credentials, `.claude.json`,
   `settings.json`, plugins) with per-project state (`projects`,
   `history.jsonl`, `sessions`, `session-env`, `shell-snapshots`). A
-  whole-directory mount shares too much. The adapter shape is "share the
-  directory, carve these subdirectories back out as private", using subpath
-  mounts or one extra private volume per carve-out.
-- `.claude.json` is a single file holding global state, the OAuth account
-  record, and the per-project settings map, and Claude Code rewrites it whole.
-  Two sandboxes sharing it will overwrite each other's edits. Decide whether
-  that is acceptable or whether only the credentials file is shared and the rest
-  seeded.
+  whole-directory mount shares too much.
+- `.claude.json` is a single file that Claude Code rewrites whole; two sandboxes
+  sharing it would overwrite each other's edits.
 - A possible zero-mount path: `claude setup-token` issues a long-lived token
-  that Claude Code reads from `CLAUDE_CODE_OAUTH_TOKEN`. Forwarded through
-  `--env` it needs no shared volume and has no concurrent-writer problem. Test
-  this first. No equivalent is known for Codex subscription auth.
+  read from `CLAUDE_CODE_OAUTH_TOKEN`, forwardable with `--env`. Test this
+  first. No equivalent is known for Codex subscription auth.
 - Codex keeps `auth.json`, `config.toml`, `sessions/`, and `history.jsonl`
-  under `CODEX_HOME` (default `~/.codex`). Confirm the layout and apply the same
-  carve-out shape.
+  under `CODEX_HOME`. Confirm the layout.
 
-A future opt-in migration is small and never a global relayout:
+## 7. Decisions to validate early
 
-1. Create a separate shared-auth volume.
-2. Select an existing project's login as the seed.
-3. Preserve the original private credentials.
-4. Copy only adapter-owned authentication state.
-5. Record the shared mount on the participating sandboxes.
-6. Recreate participating containers under the change policy.
-7. Leave the original per-project state intact until verification succeeds.
-
-## Decisions to validate early
-
-Three choices should be tested with users before becoming permanent:
+Three choices should be tested through real use before becoming permanent:
 
 1. Whether a private home per project is acceptable or repeated agent login is
    too much friction.
@@ -573,13 +716,11 @@ Three choices should be tested with users before becoming permanent:
 3. Whether an explicit `port-forward` is acceptable in place of the automatic
    wildcard URLs the revamp had.
 
-Other useful observations include which resource limits users understand,
-whether custom images are sufficient for installing their preferred agents, and
-whether `tmux` is enough for disconnect survival. The custom-image compatibility
-contract and the minimum useful environment-forwarding interface must also be
-proven before they are treated as stable public APIs.
+Other useful observations: which resource limits users understand, whether
+derivative images are sufficient for installing their preferred agents, and
+whether `tmux` is enough for disconnect survival.
 
-## Selected ideas retained from the original main branch
+## 8. Selected ideas retained from the original main branch
 
 The Claude revamp is already descended from the original `main`; this prototype
 does not merge or cherry-pick that branch. It retains only the concepts that fit
@@ -598,77 +739,304 @@ automatic host installation, Claude-specific permission modes, domain
 allowlists, broad cleanup commands, shared `node_modules`, and session-driven
 container shutdown remain intentionally excluded.
 
-## Implementation sequence
+## 9. Development plan
 
-0. Prepare the acceptance fixture. Copy the existing project's home and
-   transcripts from the v2 sliced volume into a new per-project volume using
-   Docker alone, with the source mounted read-only. Nothing in the old volumes
-   is modified or deleted; the user removes them after verification.
-1. Update this document.
-2. Carve the core out of `bin/aibox` by applying the deletions list.
-3. Replace the slice mounts with one private named volume per project, with
-   mountpoint ownership handled in the entrypoint.
-4. Preserve the lifecycle, locking, restart, and recreation protections, and add
-   the refuse-while-active rule.
-5. Revive and harden `port-forward`.
-6. Add `--dir`, `up`, `remove`, `remove --purge`, `run --env`, labels, resource
-   controls with live update, richer `status`, the unsafe-path additions, and
-   the program-not-found and port-in-use messages.
-7. Define and test the custom-image contract and probe.
-8. Add `scripts/smoke.sh` covering the success criteria mechanically, and
-   ShellCheck in CI.
-9. Validate: stop and start, Docker restart, image recreation, active-process
-   refusal, port-forward survival across recreation, private-home persistence,
-   the step 0 fixture resuming in its agent, and live limit changes.
-10. Rewrite the README only after observed behavior matches this document. Mark
-    `REVAMP.md` historical and update `package.json` files and description.
+This section is written for the agent implementing the prototype. Sections 1
+through 8 are the contract; this section is how to deliver it.
 
-## Prototype success criteria
+### 9.1 Working rules
 
-The prototype is successful when it can demonstrate all of the following:
+- Work in `bin/aibox`, a single bash file. Keep it bash 3.2 compatible (macOS
+  ships 3.2). No associative arrays, no `mapfile`, no `${var,,}`.
+- Runtime dependencies are the Docker CLI plus tools present on both macOS and
+  Debian by default. No `jq`, `python`, or `node` on the host path.
+- Carve, do not rewrite. Keep retained functions and their structure. Delete
+  removed code entirely: no dead code, no feature flags, no compatibility
+  shims for v1 or v2.
+- The command surface is exactly section 5.7. Do not add commands or flags
+  beyond it; if one seems necessary, stop and record the gap in the commit
+  message or the pull request rather than adding it.
+- AI Box writes on the host only under `~/.aibox/`, never into the project.
+- All notices to stderr (section 5.8). Never print a forwarded value.
+- Every guarantee gets a test in `scripts/smoke.sh` in the same milestone it is
+  implemented, not afterwards. A milestone is not complete until the smoke
+  script passes on Docker Desktop.
+- `bin/aibox` and `scripts/smoke.sh` pass ShellCheck with no warnings.
+  Directive comments that disable a check must say why.
+- Never touch the developer's real resources. The v2 `aibox-home` volume, the
+  v1 `aibox-auth-*` volumes, the existing v2 container, and any non-test
+  sandbox are off limits to tests and to manual experiments. Tests create
+  scratch project directories whose basename starts with `smk-`, and clean up
+  every resource they created, found by their own labels.
+- Tests must not run `stop --all` while non-test sandboxes exist on the
+  daemon.
+- Commit per milestone, or per coherent step within one, with a message that
+  names the milestone. Do not squash milestones together.
+- The README describes v2 until milestone 4. In milestone 1 add one banner
+  line at its top saying so and pointing here. Do not rewrite it earlier.
+- Do not reopen decisions in sections 1 through 8. If the document is
+  ambiguous, take the conservative reading and note it in the commit.
+- Size guide: the core should land near 600 lines. Passing 800 is a signal to
+  stop and reconsider, not a hard limit.
 
-1. Starting AI Box twice in the same project reuses one sandbox.
-2. Two terminals can execute concurrently without a creation race.
-3. Codex, Claude, or another installed CLI can run through the same generic
-   `aibox run` path.
+### 9.2 Test strategy
+
+`scripts/smoke.sh` is a bash script that exercises the real CLI against the
+local Docker daemon:
+
+- Creates one or more scratch projects under a temporary directory with the
+  `smk-` basename prefix, runs the CLI against them with `--dir`, and asserts
+  on observable state: `docker inspect` output, files in the volume, cgroup
+  values read from inside the container, exit statuses, and stderr versus
+  stdout content.
+- Prints one `PASS` or `FAIL` line per check, continues past failures, and
+  exits non-zero if any check failed.
+- Cleans up everything it created through labels, including on interruption.
+- Needs no interaction: purge tests use `--yes`.
+- Simulates failures with a stub `docker` wrapper placed first on `PATH` where
+  a real failure cannot be provoked, for example a failing `docker top`.
+- Runs on macOS Docker Desktop for every milestone. Linux Docker Engine runs
+  are required in milestones 2 and 4.
+
+Synthetic fixtures first. A helper creates a home volume with fake dotfiles
+and fake transcript files so persistence checks compare known content. The
+real acceptance fixture, copied from the developer's v2 volume, is used only in
+milestone 4 with the v2 container stopped, because a read-only mount protects
+the source from the copy but does not make a consistent snapshot while
+something is writing to it.
+
+CI runs ShellCheck on every push. CI does not run the smoke script (it needs a
+Docker daemon with the developer's characteristics); the milestone commit
+message records the smoke run's result.
+
+### 9.3 Milestones
+
+| Milestone | Deliverable | Evidence required |
+|---|---|---|
+| 1. Settle the contract | This document; ShellCheck CI; release workflow disabled; README banner; smoke harness skeleton; synthetic fixture helper | CI green; harness runs and cleans up; nothing in `bin/aibox` changed yet |
+| 2. Smallest useful core | Carved `bin/aibox`: private home, per-project network, labels, `up` (create and start only), `run`, `shell`, `stop`, `status`, `--dir`, `--env`, locking, session markers, readiness, stderr and exit-status rules, foreign-schema refusal | Reuse, concurrent commands, persistence, no unintended mounts, clean output, refusal of the v2 container, Linux ownership check |
+| 3. Make changes dependable | Explicit replacement with rollback, refusal while active, fail-closed inspection, live limits with explicit clearing, `remove` and `--purge`, image fingerprint and `--rebuild`, custom-image validation, `port-forward` | Concurrent `run` plus `up`, replacement failure recovery, active-process and inspection-failure refusal, limits effective and cleared, forwards on loopback surviving replacement |
+| 4. Validate everyday use | Real agent use through derivative images, disconnect survival with `tmux`, the copied v2 fixture resuming, Linux lifecycle run, README rewrite, publishing metadata retargeted, `REVAMP.md` marked historical | All success criteria in section 10 demonstrated; README matches observed behavior |
+
+#### Milestone 1: settle the contract
+
+Scope:
+
+- This document, revised and committed.
+- `.github/workflows/shellcheck.yml` running ShellCheck on `bin/aibox` and
+  `scripts/*.sh`.
+- The release workflow disabled (for example, its trigger changed to manual)
+  so a pushed tag cannot attempt to publish to the original npm package or
+  Homebrew tap.
+- One banner line at the top of `README.md`: the README describes v2; the
+  prototype is specified in `PROTOTYPE.md`.
+- `scripts/smoke.sh` skeleton: scratch project creation, label-based cleanup,
+  the `PASS`/`FAIL` reporter, the stub-`docker` mechanism, and a synthetic home
+  fixture helper. No lifecycle tests yet.
+
+Not in this milestone: any behavior change in `bin/aibox`.
+
+Exit criteria:
+
+- CI is green with ShellCheck passing on the current `bin/aibox` (add
+  justified directives where the inherited code needs them).
+- `scripts/smoke.sh` runs against the current CLI, reports zero checks, and
+  leaves no resources behind.
+
+#### Milestone 2: smallest useful core
+
+Scope:
+
+- Apply the deletions in section 4.3.
+- Replace the slice mounts with one private named volume; create the
+  per-project network; apply the labels of section 5.1.
+- Leading `--dir` parsing; the unsafe-path list; rejection of remote Docker
+  contexts.
+- `up` limited to create and start. No replacement logic yet except the
+  `Created`-state case.
+- `run` with `--env` (bare-name forwarding; unset is an error); the
+  program-not-found message; `shell` with the shell fallback.
+- `stop` and `status` for this project and, without a project, for all schema-3
+  sandboxes.
+- Locking as specified in section 5.6: symlink mutex, session markers,
+  fail-closed inspection, PID-based idle identification, entrypoint readiness
+  marker. The mutex protects creation; markers are written even though nothing
+  replaces yet, so milestone 3 inherits them.
+- Foreign-schema refusal for containers, volumes, and networks.
+- Notices to stderr; program exit status passthrough.
+- The entrypoint reduced to mountpoint ownership, shell skeleton, and the
+  readiness marker.
+- Image build with the fingerprint label. The default image gains `tmux`.
+- Stale-image notice from `run` and `shell`.
+
+Exit criteria, each a smoke check unless marked manual:
+
+- Two invocations in one project reuse one container, one volume, one network.
+- Two concurrent `run` invocations on an absent sandbox produce exactly one
+  container and both commands succeed.
+- The container has exactly two mounts: the project bind at its host path and
+  the home volume at `/home/aibox`.
+- An unrelated host directory is not visible inside the sandbox.
+- A file written to the home persists across `stop` and `run`; a package
+  installed with `apt` persists across `stop` and `run`.
+- `--dir` from elsewhere targets the same sandbox as running from the project.
+- `run --env NAME` delivers the value; an unset name fails before any exec;
+  the value appears nowhere in `status` or stderr.
+- `aibox run sh -c 'echo out; echo err >&2; exit 7'` yields `out` on stdout
+  only, the AI Box notices on stderr only, and exit status 7.
+- Unsafe paths are rejected; the canonical error text is asserted.
+- A container carrying the sandbox name without schema 3 is refused and left
+  untouched (fixture: a plain container created by the test with that name).
+- With the daemon endpoint made non-local through the stub, the CLI refuses.
+- A stub `docker top` failure is reported as "cannot establish safety" by the
+  idle check.
+- The readiness marker appears without any agent installer present.
+- Manual: on a Linux Docker Engine host, files created inside the sandbox are
+  owned by UID 1000 on the host, and the limitation is documented.
+
+#### Milestone 3: make changes dependable
+
+Scope:
+
+- The replacement procedure of section 5.5 in `up`, including rename-aside,
+  stop-before-start, readiness wait, and rollback restoring the previous
+  running or stopped state.
+- Refusal of replace-class changes while sessions or processes are active, and
+  on any inspection failure.
+- Live limits through `docker update`, memory always paired with memory-swap,
+  omitted flags preserving values, explicit clearing, verbatim reporting of a
+  rejected update.
+- `remove` and `remove --purge --yes`, with the retained-versus-deleted
+  report.
+- Fingerprint-driven rebuild, `up --rebuild`, and image comparison by ID.
+- Custom-image validation of section 5.9.
+- `port-forward` with its lifecycle integration into `stop`, `up`, `remove`,
+  and `status`.
+- Actionable errors for address-pool exhaustion and host port in use.
+
+Exit criteria, each a smoke check unless marked manual:
+
+- Concurrent `run` and `up --image <derivative>`: the `run` either completes
+  in the old container before replacement or lands in the new one; no process
+  is killed and no command fails with a missing-container error.
+- Replacement with an image whose entrypoint exits non-zero fails, the old
+  container is back under its name, and it is running if it was running before
+  and stopped if it was stopped before.
+- With a `tmux` server or a background `sleep` inside, `up --image` refuses
+  and names the command to run after `stop`; with the stub `docker top`
+  failing, it refuses with the inspection message.
+- `up --cpus 1.5 --memory 256m --pids 50` changes the cgroup values read from
+  inside the running container without a replacement; `up --pids 0` clears
+  the process limit live; `up --cpus 0` is refused while active and performs a
+  replacement when idle.
+- `up` with no flags after `up --cpus 2` leaves the CPU limit at 2.
+- `remove` leaves the volume and reports it; `remove --purge --yes` deletes
+  it; the network and forwarders are gone in both cases.
+- Editing `Dockerfile.extra` changes the fingerprint and `up` rebuilds and
+  replaces; `run` only prints the stale-image notice.
+- An image with a changed user or a non-passthrough entrypoint is rejected by
+  `up --image` before the existing container is touched.
+- `port-forward 18080:8080` to a server bound on the container interface is
+  reachable at `127.0.0.1:18080`, the binding is loopback only, and it still
+  works after `up --image` replaces the container without restarting the
+  sidecar. A server bound only to the container's loopback produces the
+  documented diagnosis.
+- `stop` stops the sidecar; `up` restarts it; `port-forward --stop-all`
+  removes all of this project's sidecars and no other project's.
+- Manual: Docker Desktop restart brings the sandbox and its forwarders back.
+
+#### Milestone 4: validate everyday use
+
+Scope:
+
+- A derivative image example in the README (`Dockerfile.extra`) that installs
+  Claude Code and Codex outside the home directory, and a session of each
+  through `aibox run`.
+- Disconnect survival: start an agent under `tmux`, close the terminal,
+  reattach.
+- The acceptance fixture: with the v2 container stopped, copy the developer's
+  project home and transcripts from the sliced volume into the new per-project
+  volume, chown at copy time, and confirm `claude --resume` lists the sessions.
+  The v2 volume is not modified; the cleanup commands are printed, not run.
+- The Linux lifecycle run: milestone 2 and 3 smoke checks on a Linux Docker
+  Engine host.
+- README rewritten from observed behavior, including the manual export and
+  import procedure, the `cleanupPeriodDays` warning, the dev-server interface
+  note, the address-pool note, and the security statement.
+- `REVAMP.md` marked historical at its top. `CONTRIBUTING.md` updated (no
+  `docker rmi` step; smoke and ShellCheck instructions).
+- `package.json` repository, homepage, bugs, description, and `files`
+  retargeted to the fork; the release workflow retargeted or removed.
+
+Exit criteria:
+
+- Every success criterion in section 10 is demonstrated, by the smoke script
+  where marked and manually otherwise, and the results are recorded in the
+  milestone commit message.
+- The README contains no statement that the smoke script or a manual check
+  contradicts.
+
+### 9.4 Definition of done
+
+The prototype is done when milestone 4's exit criteria hold, the core file is
+within the size guide of section 9.1, no command outside section 5.7 exists,
+and the three decisions in section 7 have been exercised through real use with
+the observations recorded in this document's next revision.
+
+## 10. Prototype success criteria
+
+Each criterion names the milestone whose exit criteria demonstrate it.
+
+1. Starting AI Box twice in the same project reuses one sandbox. (M2)
+2. Two terminals can execute concurrently without a creation race. (M2)
+3. Codex, Claude, or another installed CLI runs through the same generic
+   `aibox run` path. (M4)
 4. Disconnecting the controlling terminal leaves the sandbox available, and a
-   `tmux` session inside it survives.
-5. Stopping and restarting retains the project home and installed state.
-6. Recreating the container for an image update retains the home volume.
-7. The sandbox cannot read an unrelated host directory by default.
-8. CPU, memory, and process limits are visible and effective, and CPU and
-   process limits change live without recreation.
-9. No UI, relay, tunnel, or agent-specific session service is required.
+   `tmux` session inside it survives. (M4)
+5. Stopping and restarting retains the project home and installed state. (M2)
+6. Replacing the container for an image update retains the home volume and
+   the previous settings. (M3)
+7. The sandbox cannot read an unrelated host directory. (M2)
+8. CPU, memory, and process limits are visible and effective; CPU and process
+   limits change live without replacement. (M3)
+9. No UI, relay, tunnel, or agent-specific session service is required. (M2)
 10. A user can reach the host using a transport AI Box does not know about and
-    enter the same sandbox with a normal AI Box command.
+    enter the same sandbox with a normal AI Box command. (M4)
 11. `--dir` targets the same sandbox as running from that project's canonical
-    directory.
-12. A compatible custom image can be selected without weakening persistence or
-    mounting additional host paths.
+    directory. (M2)
+12. A derivative image can be selected without weakening persistence or
+    mounting additional host paths, and an incompatible image is rejected
+    before anything is touched. (M3)
 13. Only explicitly named environment values enter the sandbox, and their
-    values never appear in status or diagnostic output.
-14. Missing-runtime, unsafe-path, image, mount, and low-disk failures produce
-    actionable messages without modifying the host automatically.
-15. `port-forward` reaches a dev server from the host browser on loopback only,
-    is not reachable on other interfaces, and keeps working after the project
-    container is recreated without restarting the sidecar.
-16. A recreate-class change requested while processes are active is refused,
-    not applied.
-17. `remove` reports what is retained; `remove --purge` deletes the home volume
-    only after confirmation.
-18. Data copied from a v2 sliced volume into a per-project volume resumes in
-    its agent.
+    values never appear in status or diagnostic output. (M2)
+14. Missing-runtime, remote-context, unsafe-path, image, mount, and low-disk
+    failures produce actionable messages without modifying the host. (M2, M3)
+15. `port-forward` reaches a dev server on loopback only and keeps working
+    after the project container is replaced, without restarting the
+    sidecar. (M3)
+16. A replace-class change requested while processes are active, or while
+    safety cannot be established, is refused, not applied. (M3)
+17. A failed replacement leaves the previous container in place under its name
+    and in its previous state. (M3)
+18. `remove` reports what is retained; `remove --purge` deletes the home volume
+    only after confirmation. (M3)
+19. A resource with the sandbox name but a foreign schema is never adopted,
+    started, or removed. (M2)
+20. Data copied from the v2 sliced volume into a per-project volume resumes in
+    its agent. (M4)
 
-## Deferred questions
+## 11. Deferred questions
 
 The prototype does not need to settle:
 
 - A dedicated remote or mobile experience.
 - A GUI business model.
-- The shared-authentication adapters and their spike findings.
+- Shared-authentication adapters and their migration (section 6).
+- Support for arbitrary, non-derivative container images.
 - Disposable copies, worktrees, or one-container-per-task workflows.
 - Automatic dev-server URLs and preview routing.
 - Environment files or implicit provider-specific environment forwarding.
+- Automatic refresh of the base image.
 - Backups spanning every project.
 - Stronger microVM-backed isolation.
 - Windows and WSL.
