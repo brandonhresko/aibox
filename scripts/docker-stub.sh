@@ -8,6 +8,12 @@ set -u
 real_docker="${AIBOX_SMOKE_REAL_DOCKER:?AIBOX_SMOKE_REAL_DOCKER is required}"
 fail_command="${AIBOX_SMOKE_FAIL_COMMAND:-}"
 fail_status="${AIBOX_SMOKE_FAIL_STATUS:-1}"
+fake_endpoint="${AIBOX_SMOKE_DOCKER_ENDPOINT:-}"
+
+if [[ -n "$fake_endpoint" && "${1:-}" == "context" && "${2:-}" == "inspect" ]]; then
+  printf '%s\n' "$fake_endpoint"
+  exit 0
+fi
 
 if [[ -n "$fail_command" && "${1:-}" == "$fail_command" ]]; then
   printf 'synthetic docker %s failure\n' "$fail_command" >&2
